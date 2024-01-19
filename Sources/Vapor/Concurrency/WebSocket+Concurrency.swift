@@ -31,6 +31,7 @@ extension Request {
     }
 }
 
+// MARK: Deprecated
 extension RoutesBuilder {
 
     /// Adds a route for opening a web socket connection
@@ -82,7 +83,7 @@ extension WebSocket {
         to url: String,
         headers: HTTPHeaders = [:],
         configuration: WebSocketClient.Configuration = .init(),
-        on eventLoopGroup: EventLoopGroup,
+        on eventLoopGroup: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         onUpgrade: @Sendable @escaping (WebSocket) -> ()
     ) async throws {
         guard let url = URL(string: url) else {
@@ -102,7 +103,7 @@ extension WebSocket {
         to url: URL,
         headers: HTTPHeaders = [:],
         configuration: WebSocketClient.Configuration = .init(),
-        on eventLoopGroup: EventLoopGroup,
+        on eventLoopGroup: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         onUpgrade: @Sendable @escaping (WebSocket) -> ()
     ) async throws  {
         let scheme = url.scheme ?? "ws"
@@ -126,7 +127,7 @@ extension WebSocket {
         path: String = "/",
         headers: HTTPHeaders = [:],
         configuration: WebSocketClient.Configuration = .init(),
-        on eventLoopGroup: EventLoopGroup,
+        on eventLoopGroup: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         onUpgrade: @Sendable @escaping (WebSocket) -> ()
     ) async throws  {
         return try await WebSocketClient(

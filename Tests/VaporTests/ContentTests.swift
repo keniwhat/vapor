@@ -278,7 +278,7 @@ final class ContentTests: XCTestCase {
             image: File(data: "<contents of image>", filename: "UTF-8\'\'%E5%A5%B9%E5%9C%A8%E5%90%83%E6%B0%B4%E6%9E%9C.png")
         )
 
-        struct User: Content, Equatable {
+        struct User: Content, Equatable, Sendable {
             var name: String
             var age: Int
             var image: File
@@ -400,7 +400,6 @@ final class ContentTests: XCTestCase {
             return User(name: "Vapor", age: 3, luckyNumbers: [5, 7])
         }
         try app.testable().test(.GET, "/urlencodedform") { res in
-            debugPrint(res)
             XCTAssertEqual(res.status.code, 200)
             XCTAssertEqual(res.headers.contentType, .urlEncodedForm)
             XCTAssertContains(res.body.string, "luckyNumbers[]=5")

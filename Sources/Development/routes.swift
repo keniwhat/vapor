@@ -205,16 +205,17 @@ public func routes(_ app: Application) throws {
             let promise = req.eventLoop.makePromise(of: HTTPStatus.self)
             let fileHandleBox = NIOLoopBound(fileHandle, eventLoop: req.eventLoop)
             req.body.drain { part in
+                let fileHandle = fileHandleBox.value
                 switch part {
                 case .buffer(let buffer):
                     return req.application.fileio.write(
-                        fileHandle: fileHandleBox.value,
+                        fileHandle: fileHandle,
                         buffer: buffer,
                         eventLoop: req.eventLoop
                     )
                 case .error(let drainError):
                     do {
-                        try fileHandleBox.value.close()
+                        try fileHandle.close()
                         promise.fail(BodyStreamWritingToDiskError.streamFailure(drainError))
                     } catch {
                         promise.fail(BodyStreamWritingToDiskError.multipleFailures([
@@ -225,7 +226,7 @@ public func routes(_ app: Application) throws {
                     return req.eventLoop.makeSucceededFuture(())
                 case .end:
                     do {
-                        try fileHandleBox.value.close()
+                        try fileHandle.close()
                         promise.succeed(.ok)
                     } catch {
                         promise.fail(BodyStreamWritingToDiskError.fileHandleClosedFailure(error))
@@ -246,19 +247,16 @@ public func routes(_ app: Application) throws {
         return String(buffer: body)
     }
 
-    func asyncRouteTester(_ req: Request) async throws -> String {
+    asyncRoutes.get("client2") { req -> String in
         let response = try await req.client.get("https://www.google.com")
         guard let body = response.body else {
             throw Abort(.internalServerError)
         }
         return String(buffer: body)
     }
-    asyncRoutes.get("client2", use: asyncRouteTester)
     
-    asyncRoutes.get("content", use: asyncContentTester)
-    
-    func asyncContentTester(_ req: Request) async throws -> Creds {
-        return Creds(email: "name", password: "password")
+    asyncRoutes.get("content") { req in
+        Creds(email: "name", password: "password")
     }
     
     asyncRoutes.get("content2") { req async throws -> Creds in
@@ -315,15 +313,13 @@ struct TestError: AbortError, DebuggableError {
     }
 
     var source: ErrorSource?
-    var stackTrace: StackTrace?
 
     init(
         file: String = #fileID,
         function: String = #function,
         line: UInt = #line,
         column: UInt = #column,
-        range: Range<UInt>? = nil,
-        stackTrace: StackTrace? = .capture(skip: 1)
+        range: Range<UInt>? = nil
     ) {
         self.source = .init(
             file: file,
@@ -332,7 +328,6 @@ struct TestError: AbortError, DebuggableError {
             column: column,
             range: range
         )
-        self.stackTrace = stackTrace
     }
 }
 

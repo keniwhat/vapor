@@ -261,7 +261,7 @@ public final class HTTPServer: Server, Sendable {
         application: Application,
         responder: Responder,
         configuration: Configuration,
-        on eventLoopGroup: EventLoopGroup
+        on eventLoopGroup: EventLoopGroup = MultiThreadedEventLoopGroup.singleton
     ) {
         self.application = application
         self.responder = responder
@@ -452,17 +452,13 @@ private final class HTTPServerConnection: Sendable {
     }
 }
 
-final class HTTPServerErrorHandler: ChannelInboundHandler {
-    typealias InboundIn = Never
-    let logger: Logger
-    
-    init(logger: Logger) {
-        self.logger = logger
-    }
-    
-    func errorCaught(context: ChannelHandlerContext, error: Error) {
-        self.logger.debug("Unhandled HTTP server error: \(error)")
-        context.close(mode: .output, promise: nil)
+extension HTTPResponseHead {
+    /// Determines if the head is purely informational. If a head is informational another head will follow this
+    /// head eventually.
+    /// 
+    /// This is also from SwiftNIO
+    var isInformational: Bool {
+        100 <= self.status.code && self.status.code < 200 && self.status.code != 101
     }
 }
 
@@ -496,7 +492,8 @@ extension ChannelPipeline {
         handlers.append(handler)
         
         return self.addHandlers(handlers).flatMap {
-            self.addHandler(HTTPServerErrorHandler(logger: configuration.logger))
+            // close the connection in case of any errors
+            self.addHandler(NIOCloseOnErrorHandler())
         }
     }
     
@@ -568,9 +565,9 @@ extension ChannelPipeline {
         handlers.append(upgrader)
         handlers.append(handler)
         
-        // wait to add delegate as final step
         return self.addHandlers(handlers).flatMap {
-            self.addHandler(HTTPServerErrorHandler(logger: configuration.logger))
+            // close the connection in case of any errors
+            self.addHandler(NIOCloseOnErrorHandler())
         }
     }
 }

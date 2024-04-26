@@ -3,10 +3,10 @@ Packages
 .DS_Store
 *.xcodeproj
 DerivedData/
-Package.resolved
 .swiftpm
 Tests/LinuxMain.swift
 .vscode
+Build/*
 
 # API Docs Generation
 generate-package-api-docs.swift

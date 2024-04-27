@@ -42,16 +42,14 @@ final class ServerTests: XCTestCase {
         let app = Application(env)
         defer { app.shutdown() }
         
-        app.get("foo") { req in
-            return "bar"
-        }
+        app.get("foo") { _ in "bar" }
         try app.start()
         
-        let res = try app.client.get(.init(scheme: .httpUnixDomainSocket, host: socketPath, path: "/foo")).wait()
+        let res = try app.client.get(.init(scheme: .httpUnixDomainSocket, host: socketPath, path: "/foo")) { $0.timeout = .milliseconds(500) }.wait()
         XCTAssertEqual(res.body?.string, "bar")
         
         // no server should be bound to the port despite one being set on the configuration.
-        XCTAssertThrowsError(try app.client.get("http://127.0.0.1:8080/foo").wait())
+        XCTAssertThrowsError(try app.client.get("http://127.0.0.1:8080/foo") { $0.timeout = .milliseconds(500) }.wait())
     }
     
     func testIncompatibleStartupOptions() throws {
@@ -266,7 +264,7 @@ final class ServerTests: XCTestCase {
             struct Nothing: Codable {}
             XCTAssertNoThrow(try JSONDecoder().decode(Nothing.self, from: body))
         } else {
-            XCTFail()
+            XCTFail("Missing response.body")
         }
     }
     
@@ -279,9 +277,9 @@ final class ServerTests: XCTestCase {
         let smallBody = ByteBuffer(base64String: "H4sIAAAAAAAAE/NIzcnJ11Eozy/KSVEEAObG5usNAAAA")! // "Hello, world!"
         let bigBody = ByteBuffer(base64String: "H4sIAAAAAAAAE/NIzcnJ11HILU3OgBBJmenpqUUK5flFOSkKJRmJeQpJqWn5RamKAICcGhUqAAAA")! // "Hello, much much bigger world than before!"
         
-        // Max out at the smaller payload (.size is of compressed data)
+        // Max out at the smaller payload (.size is of uncompressed data)
         app.http.server.configuration.requestDecompression = .enabled(
-            limit: .size(smallBody.readableBytes)
+            limit: .size(smallOrigString.utf8.count)
         )
         app.post("gzip") { $0.body.string ?? "" }
         
@@ -314,6 +312,364 @@ final class ServerTests: XCTestCase {
         } catch {
             XCTFail("\(error)")
         }
+    }
+    
+    func testHTTP1RequestDecompression() async throws {
+        let compressiblePayload = #"{"compressed": ["key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value"]}"#
+        /// To regenerate, copy the above and run `% pbpaste | gzip | base64`. To verify, run `% pbpaste | base64 -d | gzip -d` instead.
+        let compressedPayload = ByteBuffer(base64String: "H4sIANRAImYAA6tWSs7PLShKLS5OTVGyUohWyk6tBNJKZYk5palKOgqj/FH+KH+UP8of5RPmx9YCAMfjVAhQBgAA")!
+        
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        
+        app.http.server.configuration.hostname = "127.0.0.1"
+        app.http.server.configuration.port = 0
+        
+        app.http.server.configuration.supportVersions = [.one]
+        app.http.server.configuration.requestDecompression = .disabled
+        
+        /// Make sure the client doesn't keep the server open by re-using the connection.
+        app.http.client.configuration.maximumUsesPerConnection = 1
+        
+        struct TestResponse: Content {
+            var content: ByteBuffer?
+            var contentLength: Int
+        }
+        
+        app.on(.POST, "compressed", body: .collect(maxSize: "1mb")) { request async throws in
+            let contentLength = request.headers.first(name: .contentLength).flatMap { Int($0) }
+            let contents = try await request.body.collect().get()
+            return TestResponse(
+                content: contents,
+                contentLength: contentLength ?? 0
+            )
+        }
+        
+        try app.server.start()
+        defer { app.server.shutdown() }
+        
+        XCTAssertNotNil(app.http.server.shared.localAddress)
+        guard let localAddress = app.http.server.shared.localAddress,
+              let port = localAddress.port else {
+            XCTFail("couldn't get ip/port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+        
+        let unsupportedNoncompressedResponse = try await app.client.post("http://localhost:\(port)/compressed") { request in
+            request.body = compressedPayload
+        }
+        
+        if let body = unsupportedNoncompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, compressedPayload)
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing unsupportedNoncompressedResponse.body")
+        }
+        
+        // TODO: The server should probably reject this?
+        let unsupportedCompressedResponse = try await app.client.post("http://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .contentEncoding, value: "gzip")
+            request.body = compressedPayload
+        }
+        
+        if let body = unsupportedCompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, compressedPayload)
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing unsupportedCompressedResponse.body")
+        }
+        
+        app.http.server.configuration.requestDecompression = .enabled(limit: .size(compressiblePayload.utf8.count))
+        
+        let supportedUncompressedResponse = try await app.client.post("http://localhost:\(port)/compressed") { request in
+            request.body = compressedPayload
+        }
+        
+        if let body = supportedUncompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, compressedPayload)
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing supportedUncompressedResponse.body")
+        }
+        
+        let supportedCompressedResponse = try await app.client.post("http://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .contentEncoding, value: "gzip")
+            request.body = compressedPayload
+        }
+        
+        if let body = supportedCompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, ByteBuffer(string: compressiblePayload))
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing supportedCompressedResponse.body")
+        }
+    }
+    
+    func testHTTP2RequestDecompression() async throws {
+        guard let clientCertPath = Bundle.module.url(forResource: "expired", withExtension: "crt"),
+              let clientKeyPath = Bundle.module.url(forResource: "expired", withExtension: "key") else {
+            XCTFail("Cannot load expired cert and associated key")
+            return
+        }
+        
+        let cert = try NIOSSLCertificate(file: clientCertPath.path, format: .pem)
+        let key = try NIOSSLPrivateKey(file: clientKeyPath.path, format: .pem)
+        
+        let compressiblePayload = #"{"compressed": ["key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value"]}"#
+        /// To regenerate, copy the above and run `% pbpaste | gzip | base64`. To verify, run `% pbpaste | base64 -d | gzip -d` instead.
+        let compressedPayload = ByteBuffer(base64String: "H4sIANRAImYAA6tWSs7PLShKLS5OTVGyUohWyk6tBNJKZYk5palKOgqj/FH+KH+UP8of5RPmx9YCAMfjVAhQBgAA")!
+        
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        
+        app.http.server.configuration.hostname = "127.0.0.1"
+        app.http.server.configuration.port = 0
+        
+        var serverConfig = TLSConfiguration.makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key))
+        serverConfig.certificateVerification = .noHostnameVerification
+        
+        app.http.server.configuration.tlsConfiguration = serverConfig
+        app.http.server.configuration.customCertificateVerifyCallback = { peerCerts, successPromise in
+            /// This lies and accepts the above cert, which has actually expired.
+            XCTAssertEqual(peerCerts, [cert])
+            successPromise.succeed(.certificateVerified)
+        }
+        app.http.server.configuration.supportVersions = [.two]
+        app.http.server.configuration.requestDecompression = .disabled
+        
+        /// We need to disable verification on the client, because the cert we're using has expired
+        var clientConfig = TLSConfiguration.makeClientConfiguration()
+        clientConfig.certificateVerification = .none
+        clientConfig.certificateChain = [.certificate(cert)]
+        clientConfig.privateKey = .privateKey(key)
+        app.http.client.configuration.tlsConfiguration = clientConfig
+        
+        /// Make sure the client doesn't keep the server open by re-using the connection.
+        app.http.client.configuration.maximumUsesPerConnection = 1
+        
+        struct TestResponse: Content {
+            var content: ByteBuffer?
+            var contentLength: Int
+        }
+        
+        app.post("compressed") { request async throws in
+            let contentLength = request.headers.first(name: .contentLength)
+            let contents = try await request.body.collect().get()
+            return TestResponse(
+                content: contents,
+                contentLength: contentLength.flatMap { Int($0) } ?? 0
+            )
+        }
+        
+        try app.server.start()
+        defer { app.server.shutdown() }
+        
+        XCTAssertNotNil(app.http.server.shared.localAddress)
+        guard let localAddress = app.http.server.shared.localAddress,
+              let port = localAddress.port else {
+            XCTFail("couldn't get ip/port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+        
+        let unsupportedNoncompressedResponse = try await app.client.post("https://localhost:\(port)/compressed") { request in
+            request.body = compressedPayload
+        }
+        
+        if let body = unsupportedNoncompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, compressedPayload)
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing unsupportedNoncompressedResponse.body")
+        }
+        
+        // TODO: The server should probably reject this?
+        let unsupportedCompressedResponse = try await app.client.post("https://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .contentEncoding, value: "gzip")
+            request.body = compressedPayload
+        }
+        
+        if let body = unsupportedCompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, compressedPayload)
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing unsupportedCompressedResponse.body")
+        }
+        
+        app.http.server.configuration.requestDecompression = .enabled(limit: .size(compressiblePayload.utf8.count))
+        
+        let supportedUncompressedResponse = try await app.client.post("https://localhost:\(port)/compressed") { request in
+            request.body = compressedPayload
+        }
+        
+        if let body = supportedUncompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, compressedPayload)
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing supportedUncompressedResponse.body")
+        }
+        
+        let supportedCompressedResponse = try await app.client.post("https://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .contentEncoding, value: "gzip")
+            request.body = compressedPayload
+        }
+        
+        if let body = supportedCompressedResponse.body {
+            let decodedResponse = try JSONDecoder().decode(TestResponse.self, from: body)
+            XCTAssertEqual(decodedResponse.content, ByteBuffer(string: compressiblePayload))
+            XCTAssertEqual(decodedResponse.contentLength, compressedPayload.readableBytes)
+        } else {
+            XCTFail("Missing supportedCompressedResponse.body")
+        }
+    }
+    
+    func testHTTP1ResponseDecompression() async throws {
+        let compressiblePayload = #"{"compressed": ["key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value"]}"#
+        
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        
+        app.http.server.configuration.hostname = "127.0.0.1"
+        app.http.server.configuration.port = 0
+        
+        app.http.server.configuration.supportVersions = [.one]
+        app.http.server.configuration.responseCompression = .disabled
+        
+        /// Make sure the client doesn't keep the server open by re-using the connection.
+        app.http.client.configuration.maximumUsesPerConnection = 1
+        app.http.client.configuration.decompression = .enabled(limit: .none)
+        
+        app.get("compressed") { _ in compressiblePayload }
+        
+        try app.server.start()
+        defer { app.server.shutdown() }
+        
+        XCTAssertNotNil(app.http.server.shared.localAddress)
+        guard let localAddress = app.http.server.shared.localAddress,
+              let port = localAddress.port else {
+            XCTFail("couldn't get ip/port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+        
+        let unsupportedNoncompressedResponse = try await app.client.get("http://localhost:\(port)/compressed") { request in
+            request.headers.remove(name: .acceptEncoding)
+        }
+        XCTAssertNotEqual(unsupportedNoncompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertEqual(unsupportedNoncompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(unsupportedNoncompressedResponse.body?.string, compressiblePayload)
+        
+        let unsupportedCompressedResponse = try await app.client.get("http://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .acceptEncoding, value: "gzip")
+        }
+        XCTAssertNotEqual(unsupportedCompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertEqual(unsupportedCompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(unsupportedCompressedResponse.body?.string, compressiblePayload)
+        
+        app.http.server.configuration.responseCompression = .enabled
+        
+        let supportedUncompressedResponse = try await app.client.get("http://localhost:\(port)/compressed") { request in
+            request.headers.remove(name: .acceptEncoding)
+        }
+        XCTAssertNotEqual(supportedUncompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertNotEqual(supportedUncompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(supportedUncompressedResponse.body?.string, compressiblePayload)
+        
+        let supportedCompressedResponse = try await app.client.get("http://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .acceptEncoding, value: "gzip")
+        }
+        XCTAssertEqual(supportedCompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertNotEqual(supportedCompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(supportedCompressedResponse.body?.string, compressiblePayload)
+    }
+    
+    func testHTTP2ResponseDecompression() async throws {
+        guard let clientCertPath = Bundle.module.url(forResource: "expired", withExtension: "crt"),
+              let clientKeyPath = Bundle.module.url(forResource: "expired", withExtension: "key") else {
+            XCTFail("Cannot load expired cert and associated key")
+            return
+        }
+        
+        let cert = try NIOSSLCertificate(file: clientCertPath.path, format: .pem)
+        let key = try NIOSSLPrivateKey(file: clientKeyPath.path, format: .pem)
+        
+        let compressiblePayload = #"{"compressed": ["key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value", "key": "value"]}"#
+        
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        
+        app.http.server.configuration.hostname = "127.0.0.1"
+        app.http.server.configuration.port = 0
+        
+        var serverConfig = TLSConfiguration.makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key))
+        serverConfig.certificateVerification = .noHostnameVerification
+        
+        app.http.server.configuration.tlsConfiguration = serverConfig
+        app.http.server.configuration.customCertificateVerifyCallback = { peerCerts, successPromise in
+            /// This lies and accepts the above cert, which has actually expired.
+            XCTAssertEqual(peerCerts, [cert])
+            successPromise.succeed(.certificateVerified)
+        }
+        app.http.server.configuration.supportVersions = [.two]
+        app.http.server.configuration.responseCompression = .disabled
+        
+        /// We need to disable verification on the client, because the cert we're using has expired
+        var clientConfig = TLSConfiguration.makeClientConfiguration()
+        clientConfig.certificateVerification = .none
+        clientConfig.certificateChain = [.certificate(cert)]
+        clientConfig.privateKey = .privateKey(key)
+        app.http.client.configuration.tlsConfiguration = clientConfig
+        
+        app.http.client.configuration.decompression = .enabled(limit: .none)
+        /// Make sure the client doesn't keep the server open by re-using the connection.
+        app.http.client.configuration.maximumUsesPerConnection = 1
+        
+        app.get("compressed") { _ in compressiblePayload }
+        
+        try app.server.start()
+        defer { app.server.shutdown() }
+        
+        XCTAssertNotNil(app.http.server.shared.localAddress)
+        guard let localAddress = app.http.server.shared.localAddress,
+              let port = localAddress.port else {
+            XCTFail("couldn't get ip/port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+        
+        let unsupportedNoncompressedResponse = try await app.client.get("https://localhost:\(port)/compressed") { request in
+            request.headers.remove(name: .acceptEncoding)
+        }
+        XCTAssertNotEqual(unsupportedNoncompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertEqual(unsupportedNoncompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(unsupportedNoncompressedResponse.body?.string, compressiblePayload)
+        
+        let unsupportedCompressedResponse = try await app.client.get("https://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .acceptEncoding, value: "gzip")
+        }
+        XCTAssertNotEqual(unsupportedCompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertEqual(unsupportedCompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(unsupportedCompressedResponse.body?.string, compressiblePayload)
+        
+        app.http.server.configuration.responseCompression = .enabled
+        
+        let supportedUncompressedResponse = try await app.client.get("https://localhost:\(port)/compressed") { request in
+            request.headers.remove(name: .acceptEncoding)
+        }
+        XCTAssertNotEqual(supportedUncompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertNotEqual(supportedUncompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(supportedUncompressedResponse.body?.string, compressiblePayload)
+        
+        let supportedCompressedResponse = try await app.client.get("https://localhost:\(port)/compressed") { request in
+            request.headers.replaceOrAdd(name: .acceptEncoding, value: "gzip")
+        }
+        XCTAssertEqual(supportedCompressedResponse.headers.first(name: .contentEncoding), "gzip")
+        XCTAssertNotEqual(supportedCompressedResponse.headers.first(name: .contentLength), "\(compressiblePayload.count)")
+        XCTAssertEqual(supportedCompressedResponse.body?.string, compressiblePayload)
     }
     
     func testRequestBodyStreamGetsFinalisedEvenIfClientAbandonsConnection() throws {
@@ -933,7 +1289,6 @@ final class ServerTests: XCTestCase {
             // This lies and accepts the above cert, which has actually expired.
             XCTAssertEqual(peerCerts, [cert])
             successPromise.succeed(.certificateVerified)
-            
         }
         
         // We need to disable verification on the client, because the cert we're using has expired, and we want to
@@ -967,6 +1322,101 @@ final class ServerTests: XCTestCase {
         )
         let a = try app.http.client.shared.execute(request: request).wait()
         XCTAssertEqual(a.body, ByteBuffer(string: "world"))
+    }
+    
+    func testCanChangeConfigurationDynamically() throws {
+        guard let clientCertPath = Bundle.module.url(forResource: "expired", withExtension: "crt"),
+              let clientKeyPath = Bundle.module.url(forResource: "expired", withExtension: "key") else {
+            XCTFail("Cannot load expired cert and associated key")
+            return
+        }
+        
+        let cert = try NIOSSLCertificate(file: clientCertPath.path, format: .pem)
+        let key = try NIOSSLPrivateKey(file: clientKeyPath.path, format: .pem)
+        
+        let app = Application(.testing)
+        
+        app.http.server.configuration.hostname = "127.0.0.1"
+        app.http.server.configuration.port = 0
+        app.http.server.configuration.serverName = "Old"
+        
+        /// We need to disable verification on the client, because the cert we're using has expired
+        var clientConfig = TLSConfiguration.makeClientConfiguration()
+        clientConfig.certificateVerification = .none
+        clientConfig.certificateChain = [.certificate(cert)]
+        clientConfig.privateKey = .privateKey(key)
+        app.http.client.configuration.tlsConfiguration = clientConfig
+        app.http.client.configuration.maximumUsesPerConnection = 1
+        
+        app.environment.arguments = ["serve"]
+        
+        app.get("hello") { req in
+            "world"
+        }
+        
+        defer { app.shutdown() }
+        try app.start()
+        
+        XCTAssertNotNil(app.http.server.shared.localAddress)
+        guard let localAddress = app.http.server.shared.localAddress,
+              let ip = localAddress.ipAddress,
+              let port = localAddress.port else {
+            XCTFail("couldn't get ip/port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+        
+        /// Make a regular request
+        let a = try app.http.client.shared.execute(
+            request: try HTTPClient.Request(
+                url: "http://\(ip):\(port)/hello",
+                method: .GET
+            )
+        ).wait()
+        XCTAssertEqual(a.headers[.server], ["Old"])
+        XCTAssertEqual(a.body, ByteBuffer(string: "world"))
+        
+        /// Configure server name without stopping the server
+        app.http.server.configuration.serverName = "New"
+        /// Configure TLS without stopping the server
+        var serverConfig = TLSConfiguration.makeServerConfiguration(certificateChain: [.certificate(cert)], privateKey: .privateKey(key))
+        serverConfig.certificateVerification = .noHostnameVerification
+        
+        app.http.server.configuration.tlsConfiguration = serverConfig
+        app.http.server.configuration.customCertificateVerifyCallback = { peerCerts, successPromise in
+            /// This lies and accepts the above cert, which has actually expired.
+            XCTAssertEqual(peerCerts, [cert])
+            successPromise.succeed(.certificateVerified)
+        }
+        
+        /// Make a TLS request this time around
+        let b = try app.http.client.shared.execute(
+            request: try HTTPClient.Request(
+                url: "https://\(ip):\(port)/hello",
+                method: .GET
+            )
+        ).wait()
+        XCTAssertEqual(b.headers[.server], ["New"])
+        XCTAssertEqual(b.body, ByteBuffer(string: "world"))
+        
+        /// Non-TLS request should now fail
+        XCTAssertThrowsError(try app.http.client.shared.execute(
+            request: try HTTPClient.Request(
+                url: "http://\(ip):\(port)/hello",
+                method: .GET
+            )
+        ).wait()) { error in
+            XCTAssertEqual(error as? HTTPClientError, HTTPClientError.remoteConnectionClosed)
+        }
+    }
+    
+    func testConfigurationHasActualPortAfterStart() throws {
+        let app = Application(.testing)
+        app.http.server.configuration.port = 0
+        defer { app.shutdown() }
+        try app.start()
+
+        XCTAssertNotEqual(app.http.server.configuration.port, 0)
+        XCTAssertEqual(app.http.server.configuration.port, app.http.server.shared.localAddress?.port)
     }
     
     override class func setUp() {

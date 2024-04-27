@@ -229,38 +229,23 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    func testHeadRequestWithConstantPathReturnsOK() throws {
+    func testHeadRequestForwardedToGet() throws {
         let app = Application(.testing)
         defer { app.shutdown() }
 
         app.get("hello") { req -> String in
-            return "hi"
-        }
-
-        try app.testable(method: .running(port: 0)).test(.HEAD, "/hello") { res in
-            XCTAssertEqual(res.status, .ok)
-            XCTAssertEqual(res.headers.first(name: .contentLength), "0")
-            XCTAssertEqual(res.body.readableBytes, 0)
-        }
-    }
-
-    func testHeadRequestWithParameterForwardedToGet() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
-
-        app.get("hello", ":name") { req -> String in
             XCTAssertEqual(req.method, .HEAD)
             return "hi"
         }
 
-        try app.testable(method: .running(port: 0)).test(.HEAD, "/hello/joe") { res in
+        try app.testable(method: .running(port: 0)).test(.HEAD, "/hello") { res in
             XCTAssertEqual(res.status, .ok)
             XCTAssertEqual(res.headers.first(name: .contentLength), "2")
             XCTAssertEqual(res.body.readableBytes, 0)
         }
     }
 
-    func testExplicitHeadRouteHandlerOverridesGeneratedHandler() throws {
+    func testExplicitHeadRouteOverridesForwardingToGet() throws {
         let app = Application(.testing)
         defer { app.shutdown() }
 
@@ -427,6 +412,43 @@ final class RouteTests: XCTestCase {
         
         try app.testable(method: .running(port: 0)).test(.GET, "/client") { res in
             XCTAssertEqual(res.status.code, 500)
+        }
+    }
+    
+    // https://github.com/vapor/vapor/issues/3137
+    // https://github.com/vapor/vapor/issues/3142
+    func testDoubleSlashRouteAccess() throws {
+        let app = Application(.testing)
+        defer { app.shutdown() }
+        
+        app.get(":foo", ":bar", "buz") { req -> String in
+            "\(try req.parameters.require("foo"))\(try req.parameters.require("bar"))"
+        }
+        
+        try app.testable(method: .running(port: 0)).test(.GET, "/foop/barp/buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "//foop/barp/buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "//foop//barp/buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "//foop//barp//buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "/foop//barp/buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "/foop//barp//buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "/foop/barp//buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
+        }.test(.GET, "//foop/barp//buz") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, "foopbarp")
         }
     }
 }

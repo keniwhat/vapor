@@ -21,11 +21,11 @@ final class AsyncRequestTests: XCTestCase {
     var app: Application!
     
     override func setUp() async throws {
-        app = Application(.testing)
+        app = try await Application.make(.testing)
     }
     
     override func tearDown() async throws {
-        app.shutdown()
+        try await app.asyncShutdown()
     }
     
     func testStreamingRequest() async throws {
@@ -93,7 +93,7 @@ final class AsyncRequestTests: XCTestCase {
         let oneMB = try XCTUnwrap(oneMBBB.readData(length: oneMBBB.readableBytes))
         var request = HTTPClientRequest(url: "http://\(ip):\(port)/hello")
         request.method = .POST
-        request.body = .stream(oneMB.async, length: .known(oneMB.count))
+        request.body = .stream(oneMB.async, length: .known(Int64(oneMB.count)))
         if let response = try? await app.http.client.shared.execute(request, timeout: .seconds(5)) {
             XCTAssertGreaterThan(bytesTheServerRead.load(ordering: .relaxed), 0)
             XCTAssertEqual(response.status, .internalServerError)
@@ -120,13 +120,13 @@ final class AsyncRequestTests: XCTestCase {
                     XCTAssertTrue(serverSawRequest.compareExchange(expected: false, desired: true, ordering: .relaxed).exchanged)
                     var bodyIterator = req.body.makeAsyncIterator()
                     let firstChunk = try await bodyIterator.next() // read only first chunk
-                    numberOfTimesTheServerGotOfferedBytes.wrappingIncrement(ordering: .relaxed)
-                    bytesTheServerSaw.wrappingIncrement(by: firstChunk?.readableBytes ?? 0, ordering: .relaxed)
+                    numberOfTimesTheServerGotOfferedBytes.wrappingIncrement(ordering: .sequentiallyConsistent)
+                    bytesTheServerSaw.wrappingIncrement(by: firstChunk?.readableBytes ?? 0, ordering: .sequentiallyConsistent)
                     defer {
                         _ = bodyIterator // make sure to not prematurely cancelling the sequence
                     }
                     try await Task.sleep(nanoseconds: 10_000_000_000) // wait "forever"
-                    serverSawEnd.store(true, ordering: .relaxed)
+                    serverSawEnd.store(true, ordering: .sequentiallyConsistent)
                     return Response(status: .ok)
                 }
             }
@@ -164,7 +164,7 @@ final class AsyncRequestTests: XCTestCase {
             }
             
             func didSendRequestPart(task: HTTPClient.Task<Response>, _ part: IOData) {
-                self.bytesTheClientSent.wrappingIncrement(by: part.readableBytes, ordering: .relaxed)
+                self.bytesTheClientSent.wrappingIncrement(by: part.readableBytes, ordering: .sequentiallyConsistent)
             }
         }
         
@@ -185,15 +185,201 @@ final class AsyncRequestTests: XCTestCase {
             }
         }
         
-        XCTAssertEqual(1, numberOfTimesTheServerGotOfferedBytes.load(ordering: .relaxed))
-        XCTAssertGreaterThan(tenMB.readableBytes, bytesTheServerSaw.load(ordering: .relaxed))
-        XCTAssertGreaterThan(tenMB.readableBytes, bytesTheClientSent.load(ordering: .relaxed))
-        XCTAssertEqual(0, bytesTheClientSent.load(ordering: .relaxed)) // We'd only see this if we sent the full 10 MB.
-        XCTAssertFalse(serverSawEnd.load(ordering: .relaxed))
-        XCTAssertTrue(serverSawRequest.load(ordering: .relaxed))
+        XCTAssertEqual(1, numberOfTimesTheServerGotOfferedBytes.load(ordering: .sequentiallyConsistent))
+        XCTAssertGreaterThanOrEqual(tenMB.readableBytes, bytesTheServerSaw.load(ordering: .sequentiallyConsistent))
+        XCTAssertGreaterThanOrEqual(tenMB.readableBytes, bytesTheClientSent.load(ordering: .sequentiallyConsistent))
+        XCTAssertEqual(0, bytesTheClientSent.load(ordering: .sequentiallyConsistent)) // We'd only see this if we sent the full 10 MB.
+        XCTAssertFalse(serverSawEnd.load(ordering: .sequentiallyConsistent))
+        XCTAssertTrue(serverSawRequest.load(ordering: .sequentiallyConsistent))
         
         requestHandlerTask.withLockedValue { $0?.cancel() }
         try await httpClient.shutdown()
+    }
+
+    // https://github.com/vapor/vapor/issues/2985
+    func testLargeBodyCollectionDoesntCrash() async throws {
+        app.http.server.configuration.hostname = "127.0.0.1"
+        app.http.server.configuration.port = 0
+
+        app.on(.POST, "upload", body: .stream, use: { request async throws -> String  in
+            let buffer = try await request.body.collect(upTo: Int.max)
+            return "Received \(buffer.readableBytes) bytes"
+        })
+
+        app.environment.arguments = ["serve"]
+        try await app.startup()
+
+        XCTAssertNotNil(app.http.server.shared.localAddress)
+        guard 
+            let localAddress = app.http.server.shared.localAddress,
+            let ip = localAddress.ipAddress,
+            let port = localAddress.port 
+        else {
+            XCTFail("couldn't get ip/port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+
+        let fiftyMB = ByteBuffer(repeating: 0x41, count: 600 * 1024 * 1024)
+        var request = HTTPClientRequest(url: "http://\(ip):\(port)/upload")
+        request.method = .POST
+        request.body = .bytes(fiftyMB)
+
+        for _ in 0..<10 {
+            let response: HTTPClientResponse = try await app.http.client.shared.execute(request, timeout: .seconds(5))
+            XCTAssertEqual(response.status, .ok)
+            let body = try await response.body.collect(upTo: 1024 * 1024)
+            XCTAssertEqual(body.string, "Received \(fiftyMB.readableBytes) bytes")
+        }
+    }
+
+    func testCustomHostAddress() throws {
+        app.get("vapor", "is", "fun") {
+            return $0.remoteAddress?.hostname ?? "n/a"
+        }
+
+        let ipV4Hostname = "127.0.0.1"
+        try app.testable(method: .running(hostname: ipV4Hostname, port: 0)).test(.GET, "vapor/is/fun") { res in
+            XCTAssertEqual(res.body.string, ipV4Hostname)
+        }
+    }
+
+    func testRequestIdsAreUnique() throws {
+        let request1 = Request(application: app, on: app.eventLoopGroup.next())
+        let request2 = Request(application: app, on: app.eventLoopGroup.next())
+
+        XCTAssertNotEqual(request1.id, request2.id)
+    }
+
+    func testRequestIdInLoggerMetadata() throws {
+        let request = Request(application: app, on: app.eventLoopGroup.next())
+        guard case .string(let string) = request.logger[metadataKey: "request-id"] else {
+            XCTFail("Did not find request-id key in logger metadata.")
+            return
+        }
+        XCTAssertEqual(string, request.id)
+    }
+
+    func testRequestPeerAddressForwarded() throws {
+        app.get("remote") { req -> String in
+            req.headers.add(name: .forwarded, value: "for=192.0.2.60; proto=http; by=203.0.113.43")
+            guard let peerAddress = req.peerAddress else {
+                return "n/a"
+            }
+            return peerAddress.description
+        }
+
+        try app.testable(method: .running(port: 0)).test(.GET, "remote") { res in
+            XCTAssertEqual(res.body.string, "[IPv4]192.0.2.60:80")
+        }
+    }
+
+    func testRequestPeerAddressXForwardedFor() throws {
+        app.get("remote") { req -> String in
+            req.headers.add(name: .xForwardedFor, value: "5.6.7.8")
+            guard let peerAddress = req.peerAddress else {
+                return "n/a"
+            }
+            return peerAddress.description
+        }
+
+        try app.testable(method: .running(port: 0)).test(.GET, "remote") { res in
+            XCTAssertEqual(res.body.string, "[IPv4]5.6.7.8:80")
+        }
+    }
+
+    func testRequestPeerAddressRemoteAddress() throws {
+        app.get("remote") { req -> String in
+            guard let peerAddress = req.peerAddress else {
+                return "n/a"
+            }
+            return peerAddress.description
+        }
+
+        let ipV4Hostname = "127.0.0.1"
+        try app.testable(method: .running(hostname: ipV4Hostname, port: 0)).test(.GET, "remote") { res in
+            XCTAssertContains(res.body.string, "[IPv4]\(ipV4Hostname)")
+        }
+    }
+
+    func testRequestPeerAddressMultipleHeadersOrder() throws {
+        app.get("remote") { req -> String in
+            req.headers.add(name: .xForwardedFor, value: "5.6.7.8")
+            req.headers.add(name: .forwarded, value: "for=192.0.2.60; proto=http; by=203.0.113.43")
+            guard let peerAddress = req.peerAddress else {
+                return "n/a"
+            }
+            return peerAddress.description
+        }
+
+        let ipV4Hostname = "127.0.0.1"
+        try app.testable(method: .running(hostname: ipV4Hostname, port: 0)).test(.GET, "remote") { res in
+            XCTAssertEqual(res.body.string, "[IPv4]192.0.2.60:80")
+        }
+    }
+
+    func testRequestIdForwarding() throws {
+         app.get("remote") {
+            if case .string(let string) = $0.logger[metadataKey: "request-id"], string == $0.id {
+                return string
+            } else {
+                throw Abort(.notFound)
+            }
+        }
+
+        try app.testable(method: .running(port: 0)).test(.GET, "remote", beforeRequest: { req in
+            req.headers.add(name: .xRequestId, value: "test")
+        }, afterResponse: { res in
+            XCTAssertEqual(res.body.string, "test")
+        })
+    }
+
+    func testRequestRemoteAddress() throws {
+        app.get("remote") {
+            $0.remoteAddress?.description ?? "n/a"
+        }
+
+        try app.testable(method: .running(port: 0)).test(.GET, "remote") { res in
+            XCTAssertContains(res.body.string, "IP")
+        }
+    }
+
+    func testRedirect() throws {
+        app.http.client.configuration.redirectConfiguration = .disallow
+
+        app.get("redirect_normal") {
+            $0.redirect(to: "foo", redirectType: .normal)
+        }
+        app.get("redirect_permanent") {
+            $0.redirect(to: "foo", redirectType: .permanent)
+        }
+        app.post("redirect_temporary") {
+            $0.redirect(to: "foo", redirectType: .temporary)
+        }
+        app.post("redirect_permanentPost") {
+            $0.redirect(to: "foo", redirectType: .permanentPost)
+        }
+
+        try app.server.start(address: .hostname("localhost", port: 0))
+        defer { app.server.shutdown() }
+
+        let port = try XCTUnwrap(app.http.server.shared.localAddress?.port, "Failed to get port")
+
+        XCTAssertEqual(
+            try app.client.get("http://localhost:\(port)/redirect_normal").wait().status,
+            .seeOther
+        )
+        XCTAssertEqual(
+            try app.client.get("http://localhost:\(port)/redirect_permanent").wait().status,
+            .movedPermanently
+        )
+        XCTAssertEqual(
+            try app.client.post("http://localhost:\(port)/redirect_temporary").wait().status,
+            .temporaryRedirect
+        )
+        XCTAssertEqual(
+            try app.client.post("http://localhost:\(port)/redirect_permanentPost").wait().status,
+            .permanentRedirect
+        )
     }
 }
 

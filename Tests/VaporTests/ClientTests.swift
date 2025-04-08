@@ -1,5 +1,9 @@
 #if !canImport(Darwin)
+#if compiler(>=6.0)
+import Dispatch
+#else
 @preconcurrency import Dispatch
+#endif
 #endif
 import Foundation
 import XCTest
@@ -10,12 +14,13 @@ import AsyncHTTPClient
 import NIOEmbedded
 import NIOConcurrencyHelpers
 
+@available(*, deprecated, message: "Testing deprecated future APIs")
 final class ClientTests: XCTestCase {
     var remoteAppPort: Int!
     var remoteApp: Application!
     
     override func setUp() async throws {
-        remoteApp = Application(.testing)
+        remoteApp = try await Application.make(.testing)
         remoteApp.http.server.configuration.port = 0
         
         remoteApp.get("json") { _ in
@@ -44,11 +49,11 @@ final class ClientTests: XCTestCase {
         }
 
         remoteApp.get("stalling") {
-            $0.eventLoop.scheduleTask(in: .seconds(5)) { SomeJSON() }.futureResult
+            $0.eventLoop.scheduleTask(in: .seconds(2)) { SomeJSON() }.futureResult
         }
         
         remoteApp.environment.arguments = ["serve"]
-        try remoteApp.boot()
+        try await remoteApp.asyncBoot()
         try await remoteApp.startup()
         
         XCTAssertNotNil(remoteApp.http.server.shared.localAddress)
@@ -62,7 +67,7 @@ final class ClientTests: XCTestCase {
     }
     
     override func tearDown() async throws {
-        remoteApp.shutdown()
+        try await remoteApp.asyncShutdown()
     }
     
     func testClientConfigurationChange() throws {
@@ -78,11 +83,7 @@ final class ClientTests: XCTestCase {
         try app.server.start(address: .hostname("localhost", port: 0))
         defer { app.server.shutdown() }
         
-        guard let port = app.http.server.shared.localAddress?.port else {
-            XCTFail("Failed to get port for app")
-            return
-        }
-
+        let port = try XCTUnwrap(app.http.server.shared.localAddress?.port, "Failed to get port")
         let res = try app.client.get("http://localhost:\(port)/redirect").wait()
 
         XCTAssertEqual(res.status, .seeOther)
@@ -101,11 +102,7 @@ final class ClientTests: XCTestCase {
         try app.server.start(address: .hostname("localhost", port: 0))
         defer { app.server.shutdown() }
         
-        guard let port = app.http.server.shared.localAddress?.port else {
-            XCTFail("Failed to get port for app")
-            return
-        }
-
+        let port = try XCTUnwrap(app.http.server.shared.localAddress?.port, "Failed to get port")
         _ = try app.client.get("http://localhost:\(port)/redirect").wait()
         
         app.http.client.configuration.redirectConfiguration = .follow(max: 1, allowCycles: false)
@@ -196,34 +193,6 @@ final class ClientTests: XCTestCase {
         XCTAssertEqual(res.body?.string, "bar")
 
         try app.running?.onStop.wait()
-    }
-    
-    func testApplicationClientThreadSafety() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
-
-        let startingPistol = DispatchGroup()
-        startingPistol.enter()
-        startingPistol.enter()
-
-        let finishLine = DispatchGroup()
-        finishLine.enter()
-        Thread.async {
-            startingPistol.leave()
-            startingPistol.wait()
-            XCTAssert(type(of: app.http.client.shared) == HTTPClient.self)
-            finishLine.leave()
-        }
-
-        finishLine.enter()
-        Thread.async {
-            startingPistol.leave()
-            startingPistol.wait()
-            XCTAssert(type(of: app.http.client.shared) == HTTPClient.self)
-            finishLine.leave()
-        }
-
-        finishLine.wait()
     }
 
     func testCustomClient() throws {

@@ -3,6 +3,16 @@ import Vapor
 import Logging
 
 final class ErrorTests: XCTestCase {
+    var app: Application!
+
+    override func setUp() async throws {
+        app = try await Application.make(.testing)
+    }
+
+    override func tearDown() async throws {
+        try await app.asyncShutdown()
+    }
+
     func testPrintable() throws {
         let expectedPrintable = """
         FooError.noFoo: You do not have a `foo`.
@@ -67,9 +77,6 @@ final class ErrorTests: XCTestCase {
     }
 
     func testAbortError() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
-
         app.get("foo") { req -> String in
             throw Abort(.internalServerError, reason: "Foo")
         }
@@ -93,6 +100,27 @@ final class ErrorTests: XCTestCase {
             let abort = try res.content.decode(AbortResponse.self)
             XCTAssertEqual(abort.reason, "After decode")
         })
+    }
+    
+    func testErrorMiddlewareUsesContentConfiguration() throws {
+        app.get("foo") { req -> String in
+            throw Abort(.internalServerError, reason: "Foo")
+        }
+        
+        ContentConfiguration.global.use(encoder: URLEncodedFormEncoder(), for: .json)
+        
+        try app.test(.GET, "foo") { res in
+            XCTAssertEqual(res.status, HTTPStatus.internalServerError)
+            let option1 = "error=true&reason=Foo"
+            let option2 = "reason=Foo&error=true"
+            guard res.body.string == option1 || res.body.string == option2 else {
+                XCTFail("Response does not match")
+                return
+            }
+        }
+        
+        // Clean up
+        ContentConfiguration.global.use(encoder: JSONEncoder(), for: .json)
     }
 }
 

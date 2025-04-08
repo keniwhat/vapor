@@ -71,27 +71,27 @@ public struct HTTPMediaType: Hashable, CustomStringConvertible, Equatable, Senda
     ///
     /// In the `MediaType` `"application/json; charset=utf8"`:
     ///
-    /// - type: `"application"`
-    /// - subtype: `"json"`
-    /// - parameters: ["charset": "utf8"]
+    /// - `type`: `"application"`
+    /// - `subtype`: `"json"`
+    /// - `parameters`: `["charset": "utf8"]` 
     public var type: String
     
     /// The `MediaType`'s specific type. Usually a unique string.
     ///
     /// In the `MediaType` `"application/json; charset=utf8"`:
     ///
-    /// - type: `"application"`
-    /// - subtype: `"json"`
-    /// - parameters: ["charset": "utf8"]
+    /// - `type`: `"application"`
+    /// - `subtype`: `"json"`
+    /// - `parameters`: `["charset": "utf8"]`
     public var subType: String
     
     /// The `MediaType`'s metadata. Zero or more key/value pairs.
     ///
     /// In the `MediaType` `"application/json; charset=utf8"`:
     ///
-    /// - type: `"application"`
-    /// - subtype: `"json"`
-    /// - parameters: ["charset": "utf8"]
+    /// - `type`: `"application"`
+    /// - `subtype`: `"json"`
+    /// - `parameters`: `["charset": "utf8"]`
     public var parameters: [String: String]
     
     /// Converts this `MediaType` into its string representation.
@@ -167,6 +167,57 @@ public struct HTTPMediaType: Hashable, CustomStringConvertible, Equatable, Senda
     }
 }
 
+/// A collection for efficiently determining if a set of types contains another type.
+public struct HTTPMediaTypeSet: Sendable {
+    let mediaTypeLookup: [String : [String : Set<HTTPMediaType>]]
+    let allowsAny: Bool
+    let allowsNone: Bool
+    
+    public init(mediaTypes: some Sequence<HTTPMediaType>) {
+        var mediaTypeLookup: [String : [String : Set<HTTPMediaType>]] = [:]
+        for mediaType in mediaTypes {
+            mediaTypeLookup[mediaType.type, default: [:]][mediaType.subType, default: Set()].insert(mediaType)
+        }
+        self.mediaTypeLookup = mediaTypeLookup
+        self.allowsAny = mediaTypeLookup["*"] != nil
+        self.allowsNone = mediaTypeLookup.isEmpty
+    }
+    
+    /// Check to see if a media type is contained within the set.
+    public func contains(_ mediaType: HTTPMediaType) -> Bool {
+        /// If we allow any type or no types, stop here. These are uncommon cases, so we cache the results ahead of time to avoid the extra dictionary checks.
+        if allowsAny { return true }
+        if allowsNone { return false }
+        
+        /// Make sure we have an entry for the specific type:
+        guard let mediaSubTypeLookup = mediaTypeLookup[mediaType.type]
+        else { return false }
+        
+        /// If we alow any of the subtypes, stop here.
+        if mediaSubTypeLookup["*"] != nil { return true }
+        
+        /// Make sure we have an entry for the specific sub type:
+        guard let mediaTypes = mediaSubTypeLookup[mediaType.subType]
+        else { return false }
+        
+        /// Check and return true if either the type as is (with potential parameters), or the parameter-less type is in the set:
+        return mediaTypes.contains(mediaType) || mediaTypes.contains(HTTPMediaType(type: mediaType.type, subType: mediaType.subType))
+    }
+    
+    /// The super set of all ``HTTPMediaType``s.
+    public static let all = HTTPMediaTypeSet(mediaTypes: [.any])
+    
+    /// The empty set of ``HTTPMediaType``s.
+    public static let none = HTTPMediaTypeSet(mediaTypes: [])
+}
+
+extension HTTPMediaTypeSet: ExpressibleByArrayLiteral {
+    public init(arrayLiteral elements: HTTPMediaType...) {
+        self = HTTPMediaTypeSet(mediaTypes: elements)
+    }
+}
+
+// MARK: - Media Type Dataset
 public extension HTTPMediaType {
     /// Any media type (*/*).
     static let any = HTTPMediaType(type: "*", subType: "*")
@@ -222,6 +273,14 @@ public extension HTTPMediaType {
     static let png = HTTPMediaType(type: "image", subType: "png")
     /// SVG image.
     static let svg = HTTPMediaType(type: "image", subType: "svg+xml")
+    /// TIFF image.
+    static let tiff = HTTPMediaType(type: "image", subType: "tiff")
+    /// WebP image.
+    static let webp = HTTPMediaType(type: "image", subType: "webp")
+    /// JPEG XL image.
+    static let jxl = HTTPMediaType(type: "image", subType: "jxl")
+    /// AVIF image.
+    static let avif = HTTPMediaType(type: "image", subType: "avif")
     /// Basic audio.
     static let audio = HTTPMediaType(type: "audio", subType: "basic")
     /// MIDI audio.
@@ -238,7 +297,7 @@ public extension HTTPMediaType {
     static let mpeg = HTTPMediaType(type: "video", subType: "mpeg")
 }
 
-// MARK: Extensions
+// MARK: File Extensions
 let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "ez": HTTPMediaType(type: "application", subType: "andrew-inset"),
     "anx": HTTPMediaType(type: "application", subType: "annodex"),
@@ -258,7 +317,7 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "class": HTTPMediaType(type: "application", subType: "java-vm"),
     "js": HTTPMediaType(type: "application", subType: "javascript"),
     "mjs": HTTPMediaType(type: "application", subType: "javascript"),
-    "json": HTTPMediaType(type: "application", subType: "json"),
+    "json": HTTPMediaType.json,
     "m3g": HTTPMediaType(type: "application", subType: "m3g"),
     "hqx": HTTPMediaType(type: "application", subType: "mac-binhex40"),
     "cpt": HTTPMediaType(type: "application", subType: "mac-compactpro"),
@@ -269,14 +328,14 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "doc": HTTPMediaType(type: "application", subType: "msword"),
     "dot": HTTPMediaType(type: "application", subType: "msword"),
     "mxf": HTTPMediaType(type: "application", subType: "mxf"),
-    "bin": HTTPMediaType(type: "application", subType: "octet-stream"),
+    "bin": HTTPMediaType.binary,
     "oda": HTTPMediaType(type: "application", subType: "oda"),
     "ogx": HTTPMediaType(type: "application", subType: "ogg"),
     "one": HTTPMediaType(type: "application", subType: "onenote"),
     "onetoc2": HTTPMediaType(type: "application", subType: "onenote"),
     "onetmp": HTTPMediaType(type: "application", subType: "onenote"),
     "onepkg": HTTPMediaType(type: "application", subType: "onenote"),
-    "pdf": HTTPMediaType(type: "application", subType: "pdf"),
+    "pdf": HTTPMediaType.pdf,
     "pgp": HTTPMediaType(type: "application", subType: "pgp-encrypted"),
     "key": HTTPMediaType(type: "application", subType: "pgp-keys"),
     "sig": HTTPMediaType(type: "application", subType: "pgp-signature"),
@@ -296,12 +355,12 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "smil": HTTPMediaType(type: "application", subType: "smil+xml"),
     "xhtml": HTTPMediaType(type: "application", subType: "xhtml+xml"),
     "xht": HTTPMediaType(type: "application", subType: "xhtml+xml"),
-    "xml": HTTPMediaType(type: "application", subType: "xml"),
-    "xsd": HTTPMediaType(type: "application", subType: "xml"),
+    "xml": HTTPMediaType.xml,
+    "xsd": HTTPMediaType.xml,
     "xsl": HTTPMediaType(type: "application", subType: "xslt+xml"),
     "xslt": HTTPMediaType(type: "application", subType: "xslt+xml"),
     "xspf": HTTPMediaType(type: "application", subType: "xspf+xml"),
-    "zip": HTTPMediaType(type: "application", subType: "zip"),
+    "zip": HTTPMediaType.zip,
     "apk": HTTPMediaType(type: "application", subType: "vnd.android.package-archive"),
     "cdy": HTTPMediaType(type: "application", subType: "vnd.cinderella"),
     "kml": HTTPMediaType(type: "application", subType: "vnd.google-earth.kml+xml"),
@@ -491,7 +550,7 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "sitx": HTTPMediaType(type: "application", subType: "x-stuffit"),
     "sv4cpio": HTTPMediaType(type: "application", subType: "x-sv4cpio"),
     "sv4crc": HTTPMediaType(type: "application", subType: "x-sv4crc"),
-    "tar": HTTPMediaType(type: "application", subType: "x-tar"),
+    "tar": HTTPMediaType.tar,
     "tcl": HTTPMediaType(type: "application", subType: "x-tcl"),
     "gf": HTTPMediaType(type: "application", subType: "x-tex-gf"),
     "pk": HTTPMediaType(type: "application", subType: "x-tex-pk"),
@@ -518,8 +577,8 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "amr": HTTPMediaType(type: "audio", subType: "amr"),
     "awb": HTTPMediaType(type: "audio", subType: "amr-wb"),
     "axa": HTTPMediaType(type: "audio", subType: "annodex"),
-    "au": HTTPMediaType(type: "audio", subType: "basic"),
-    "snd": HTTPMediaType(type: "audio", subType: "basic"),
+    "au": HTTPMediaType.audio,
+    "snd": HTTPMediaType.audio,
     "csd": HTTPMediaType(type: "audio", subType: "csound"),
     "orc": HTTPMediaType(type: "audio", subType: "csound"),
     "sco": HTTPMediaType(type: "audio", subType: "csound"),
@@ -527,11 +586,11 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "mid": HTTPMediaType(type: "audio", subType: "midi"),
     "midi": HTTPMediaType(type: "audio", subType: "midi"),
     "kar": HTTPMediaType(type: "audio", subType: "midi"),
-    "mpga": HTTPMediaType(type: "audio", subType: "mpeg"),
-    "mpega": HTTPMediaType(type: "audio", subType: "mpeg"),
-    "mp2": HTTPMediaType(type: "audio", subType: "mpeg"),
-    "mp3": HTTPMediaType(type: "audio", subType: "mpeg"),
-    "m4a": HTTPMediaType(type: "audio", subType: "mpeg"),
+    "mpga": HTTPMediaType.mp3,
+    "mpega": HTTPMediaType.mp3,
+    "mp2": HTTPMediaType.mp3,
+    "mp3": HTTPMediaType.mp3,
+    "m4a": HTTPMediaType.mp3,
     "m3u": HTTPMediaType(type: "audio", subType: "mpegurl"),
     "oga": HTTPMediaType(type: "audio", subType: "ogg"),
     "ogg": HTTPMediaType(type: "audio", subType: "ogg"),
@@ -622,22 +681,25 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "vmd": HTTPMediaType(type: "chemical", subType: "x-vmd"),
     "xtel": HTTPMediaType(type: "chemical", subType: "x-xtel"),
     "xyz": HTTPMediaType(type: "chemical", subType: "x-xyz"),
-    "gif": HTTPMediaType(type: "image", subType: "gif"),
+    "gif": HTTPMediaType.gif,
     "ief": HTTPMediaType(type: "image", subType: "ief"),
     "jp2": HTTPMediaType(type: "image", subType: "jp2"),
     "jpg2": HTTPMediaType(type: "image", subType: "jp2"),
-    "jpeg": HTTPMediaType(type: "image", subType: "jpeg"),
-    "jpg": HTTPMediaType(type: "image", subType: "jpeg"),
-    "jpe": HTTPMediaType(type: "image", subType: "jpeg"),
+    "jpeg": HTTPMediaType.jpeg,
+    "jpg": HTTPMediaType.jpeg,
+    "jpe": HTTPMediaType.jpeg,
     "jpm": HTTPMediaType(type: "image", subType: "jpm"),
     "jpx": HTTPMediaType(type: "image", subType: "jpx"),
     "jpf": HTTPMediaType(type: "image", subType: "jpx"),
     "pcx": HTTPMediaType(type: "image", subType: "pcx"),
-    "png": HTTPMediaType(type: "image", subType: "png"),
-    "svg": HTTPMediaType(type: "image", subType: "svg+xml"),
-    "svgz": HTTPMediaType(type: "image", subType: "svg+xml"),
-    "tiff": HTTPMediaType(type: "image", subType: "tiff"),
-    "tif": HTTPMediaType(type: "image", subType: "tiff"),
+    "png": HTTPMediaType.png,
+    "svg": HTTPMediaType.svg,
+    "svgz": HTTPMediaType.svg,
+    "tiff": HTTPMediaType.tiff,
+    "tif": HTTPMediaType.tiff,
+    "webp": HTTPMediaType.webp,
+    "jxl": HTTPMediaType.jxl,
+    "avif": HTTPMediaType.avif,
     "djvu": HTTPMediaType(type: "image", subType: "vnd.djvu"),
     "djv": HTTPMediaType(type: "image", subType: "vnd.djvu"),
     "ico": HTTPMediaType(type: "image", subType: "vnd.microsoft.icon"),
@@ -677,20 +739,20 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "appcache": HTTPMediaType(type: "text", subType: "cache-manifest"),
     "ics": HTTPMediaType(type: "text", subType: "calendar"),
     "icz": HTTPMediaType(type: "text", subType: "calendar"),
-    "css": HTTPMediaType(type: "text", subType: "css"),
+    "css": HTTPMediaType.css,
     "csv": HTTPMediaType(type: "text", subType: "csv"),
     "323": HTTPMediaType(type: "text", subType: "h323"),
-    "html": HTTPMediaType(type: "text", subType: "html"),
-    "htm": HTTPMediaType(type: "text", subType: "html"),
-    "shtml": HTTPMediaType(type: "text", subType: "html"),
+    "html": HTTPMediaType.html,
+    "htm": HTTPMediaType.html,
+    "shtml": HTTPMediaType.html,
     "uls": HTTPMediaType(type: "text", subType: "iuls"),
     "mml": HTTPMediaType(type: "text", subType: "mathml"),
-    "asc": HTTPMediaType(type: "text", subType: "plain"),
-    "txt": HTTPMediaType(type: "text", subType: "plain"),
-    "text": HTTPMediaType(type: "text", subType: "plain"),
-    "pot": HTTPMediaType(type: "text", subType: "plain"),
-    "brf": HTTPMediaType(type: "text", subType: "plain"),
-    "srt": HTTPMediaType(type: "text", subType: "plain"),
+    "asc": HTTPMediaType.plainText,
+    "txt": HTTPMediaType.plainText,
+    "text": HTTPMediaType.plainText,
+    "pot": HTTPMediaType.plainText,
+    "brf": HTTPMediaType.plainText,
+    "srt": HTTPMediaType.plainText,
     "rtx": HTTPMediaType(type: "text", subType: "richtext"),
     "sct": HTTPMediaType(type: "text", subType: "scriptlet"),
     "wsc": HTTPMediaType(type: "text", subType: "scriptlet"),
@@ -744,9 +806,9 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "dv": HTTPMediaType(type: "video", subType: "dv"),
     "fli": HTTPMediaType(type: "video", subType: "fli"),
     "gl": HTTPMediaType(type: "video", subType: "gl"),
-    "mpeg": HTTPMediaType(type: "video", subType: "mpeg"),
-    "mpg": HTTPMediaType(type: "video", subType: "mpeg"),
-    "mpe": HTTPMediaType(type: "video", subType: "mpeg"),
+    "mpeg": HTTPMediaType.mpeg,
+    "mpg": HTTPMediaType.mpeg,
+    "mpe": HTTPMediaType.mpeg,
     "ts": HTTPMediaType(type: "video", subType: "MP2T"),
     "mp4": HTTPMediaType(type: "video", subType: "mp4"),
     "qt": HTTPMediaType(type: "video", subType: "quicktime"),
@@ -772,3 +834,104 @@ let fileExtensionMediaTypeMapping: [String: HTTPMediaType] = [
     "sisx": HTTPMediaType(type: "x-epoc", subType: "x-sisx-app"),
     "vrm": HTTPMediaType(type: "x-world", subType: "x-vrml"),
 ]
+
+// MARK: Compression Support
+extension HTTPMediaTypeSet {
+    /// A list of known compressible MIME types.
+    ///
+    /// If you know a type would almost always benefit from on-the-wire compression, please add it to this list!
+    public static let compressible: HTTPMediaTypeSet = [
+        HTTPMediaType(type: "application", subType: "atom+xml"),
+        HTTPMediaType(type: "application", subType: "atomcat+xml"),
+        HTTPMediaType(type: "application", subType: "atomserv+xml"),
+        HTTPMediaType(type: "application", subType: "davmount+xml"),
+        HTTPMediaType(type: "application", subType: "ecmascript"),
+        HTTPMediaType(type: "application", subType: "javascript"),
+        HTTPMediaType.json,
+        HTTPMediaType.jsonSequence,
+        HTTPMediaType(type: "application", subType: "rdf+xml"),
+        HTTPMediaType(type: "application", subType: "rtf"),
+        HTTPMediaType(type: "application", subType: "smil+xml"),
+        HTTPMediaType(type: "application", subType: "xhtml+xml"),
+        HTTPMediaType.xml,
+        HTTPMediaType(type: "application", subType: "xslt+xml"),
+        HTTPMediaType(type: "application", subType: "xspf+xml"),
+        HTTPMediaType.jsonAPI,
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.calc"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.calc.template"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.draw"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.draw.template"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.impress"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.impress.template"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.math"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.writer"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.writer.global"),
+        HTTPMediaType(type: "application", subType: "vnd.sun.xml.writer.template"),
+        HTTPMediaType(type: "application", subType: "x-mpegURL"),
+        HTTPMediaType(type: "application", subType: "x-python-code"),
+        HTTPMediaType(type: "application", subType: "x-rss+xml"),
+        HTTPMediaType(type: "application", subType: "x-ruby"),
+        HTTPMediaType(type: "application", subType: "x-sh"),
+        HTTPMediaType.urlEncodedForm,
+        HTTPMediaType.svg,
+        HTTPMediaType(type: "model", subType: "vrml"),
+        HTTPMediaType(type: "model", subType: "x3d+vrml"),
+        HTTPMediaType(type: "model", subType: "x3d+xml"),
+        HTTPMediaType.formData,
+        HTTPMediaType(type: "text", subType: "*"),
+    ]
+    
+    /// A list of known incompressible MIME types.
+    ///
+    /// If you know a type would almost never benefit from on-the-wire compression, please add it to this list!
+    public static let incompressible: HTTPMediaTypeSet = [
+        HTTPMediaType(type: "application", subType: "rar"),
+        HTTPMediaType.zip,
+        HTTPMediaType(type: "application", subType: "x-7z-compressed"),
+        HTTPMediaType(type: "application", subType: "x-apple-diskimage"),
+        HTTPMediaType(type: "application", subType: "x-gtar"),
+        HTTPMediaType(type: "application", subType: "x-gtar-compressed"),
+        HTTPMediaType(type: "application", subType: "x-lha"),
+        HTTPMediaType(type: "application", subType: "x-lzh"),
+        HTTPMediaType(type: "application", subType: "x-lzx"),
+        HTTPMediaType.tar,
+        HTTPMediaType(type: "audio", subType: "*"),
+        HTTPMediaType.gif,
+        HTTPMediaType(type: "image", subType: "ief"),
+        HTTPMediaType(type: "image", subType: "jp2"),
+        HTTPMediaType.jpeg,
+        HTTPMediaType(type: "image", subType: "jpm"),
+        HTTPMediaType(type: "image", subType: "jpx"),
+        HTTPMediaType(type: "image", subType: "pcx"),
+        HTTPMediaType.png,
+        HTTPMediaType.tiff,
+        HTTPMediaType.webp,
+        HTTPMediaType.jxl,
+        HTTPMediaType.avif,
+        HTTPMediaType(type: "image", subType: "vnd.djvu"),
+        HTTPMediaType(type: "image", subType: "vnd.microsoft.icon"),
+        HTTPMediaType(type: "image", subType: "vnd.wap.wbmp"),
+        HTTPMediaType(type: "image", subType: "x-canon-cr2"),
+        HTTPMediaType(type: "image", subType: "x-canon-crw"),
+        HTTPMediaType(type: "image", subType: "x-cmu-raster"),
+        HTTPMediaType(type: "image", subType: "x-coreldraw"),
+        HTTPMediaType(type: "image", subType: "x-coreldrawpattern"),
+        HTTPMediaType(type: "image", subType: "x-coreldrawtemplate"),
+        HTTPMediaType(type: "image", subType: "x-epson-erf"),
+        HTTPMediaType(type: "image", subType: "x-jg"),
+        HTTPMediaType(type: "image", subType: "x-jng"),
+        HTTPMediaType(type: "image", subType: "x-ms-bmp"),
+        HTTPMediaType(type: "image", subType: "x-nikon-nef"),
+        HTTPMediaType(type: "image", subType: "x-olympus-orf"),
+        HTTPMediaType(type: "image", subType: "x-photoshop"),
+        HTTPMediaType(type: "image", subType: "x-portable-anymap"),
+        HTTPMediaType(type: "image", subType: "x-portable-bitmap"),
+        HTTPMediaType(type: "image", subType: "x-portable-graymap"),
+        HTTPMediaType(type: "image", subType: "x-portable-pixmap"),
+        HTTPMediaType(type: "image", subType: "x-rgb"),
+        HTTPMediaType(type: "image", subType: "x-xbitmap"),
+        HTTPMediaType(type: "image", subType: "x-xpixmap"),
+        HTTPMediaType(type: "image", subType: "x-xwindowdump"),
+        HTTPMediaType(type: "video", subType: "*"),
+    ]
+}

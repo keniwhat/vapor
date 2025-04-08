@@ -1,5 +1,9 @@
-#if os(Linux)
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
 #else
 import Darwin.C
 #endif

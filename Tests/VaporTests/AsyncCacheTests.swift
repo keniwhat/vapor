@@ -2,12 +2,22 @@ import XCTVapor
 import XCTest
 import Vapor
 import NIOCore
+#if canImport(Android)
+import func Android.sleep
+#endif
 
 final class AsyncCacheTests: XCTestCase {
+    var app: Application!
+    
+    override func setUp() async throws {
+        app = try await Application.make(.testing)
+    }
+    
+    override func tearDown() async throws {
+        try await app.asyncShutdown()
+    }
+    
     func testInMemoryCache() async throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
-
         let value1 = try await app.cache.get("foo", as: String.self)
         XCTAssertNil(value1)
         try await app.cache.set("foo", to: "bar")
@@ -33,8 +43,6 @@ final class AsyncCacheTests: XCTestCase {
     }
 
     func testCustomCache() async throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
         app.caches.use(.foo)
         try await app.cache.set("1", to: "2")
         let value = try await app.cache.get("foo", as: String.self)
@@ -57,7 +65,7 @@ struct FooCache: Cache {
     }
 
     func get<T>(_ key: String, as type: T.Type) -> EventLoopFuture<T?>
-        where T : Decodable
+        where T : Decodable & Sendable
     {
         let value: T?
         if key == "foo" {
@@ -68,15 +76,15 @@ struct FooCache: Cache {
         return self.eventLoop.makeSucceededFuture(value)
     }
     
-    func get<T>(_ key: String, as type: T.Type) async throws -> T? where T: Decodable {
+    func get<T>(_ key: String, as type: T.Type) async throws -> T? where T: Decodable & Sendable {
         return key == "foo" ? "bar" as? T : nil
     }
 
-    func set<T>(_ key: String, to value: T?) -> EventLoopFuture<Void> where T : Encodable {
+    func set<T>(_ key: String, to value: T?) -> EventLoopFuture<Void> where T : Encodable & Sendable {
         return self.eventLoop.makeSucceededFuture(())
     }
     
-    func set<T>(_ key: String, to value: T?) async throws where T: Encodable {
+    func set<T>(_ key: String, to value: T?) async throws where T: Encodable & Sendable {
         return
     }
 

@@ -53,6 +53,19 @@ class ValidationTests: XCTestCase {
                 // validate the email is valid or is nil
                 v.add("email", as: String?.self, is: .nil || .email)
                 v.add("email", as: String?.self, is: .email || .nil) // test other way
+                v.add(
+                    "email",
+                    as: String?.self,
+                    is: .custom(
+                        "Validates whether email domain is 'tanner.xyz'."
+                    ) { email in
+                        if let email {
+                            let parts = email.split(separator: "@")
+                            return parts[parts.count - 1] == "tanner.xyz"
+                        }
+                        return true
+                    }
+                )
                 // validate that the lucky number is nil or is 5 or 7
                 v.add("luckyNumber", as: Int?.self, is: .nil || .in(5, 7))
                 // validate that the profile picture is nil or a valid URL
@@ -467,7 +480,9 @@ class ValidationTests: XCTestCase {
 
     func testEmail() {
         assert("tanner@vapor.codes", passes: .email)
+        assert("tanner@VAPOR.codes", passes: .email)
         assert("tanner@vapor.codes", fails: !.email, "is a valid email address")
+        assert("tanner@VAPOR.codes", fails: !.email, "is a valid email address")
         assert("tanner@vapor.codestanner@vapor.codes", fails: .email, "is not a valid email address")
         assert("tanner@vapor.codes.", fails: .email, "is not a valid email address")
         assert("tanner@@vapor.codes", fails: .email, "is not a valid email address")
@@ -602,7 +617,7 @@ class ValidationTests: XCTestCase {
         assert("CASE2", fails: .case(of: SingleCaseEnum.self), "is not CASE1")
     }
 
-    func testCustomResponseMiddleware() throws {
+    func testCustomResponseMiddleware() async throws {
         // Test item
         struct User: Validatable {
             let name: String
@@ -617,8 +632,7 @@ class ValidationTests: XCTestCase {
         }
 
         // Setup
-        let app = Application(.testing)
-        defer { app.shutdown() }
+        let app = try await Application.make(.testing)
 
         // Converts validation errors to a custom response.
         final class ValidationErrorMiddleware: Middleware {
@@ -680,7 +694,7 @@ class ValidationTests: XCTestCase {
         }
 
         // Test that the custom validation error middleware is working.
-        try app.test(.POST, "users", beforeRequest: { req in
+        try await app.test(.POST, "users", beforeRequest: { req async throws in
             try req.content.encode([
                 "name": "Vapor",
                 "age": "asdf"
@@ -690,6 +704,8 @@ class ValidationTests: XCTestCase {
             let content = try res.content.decode(ValidationErrorMiddleware.ErrorResponse.self)
             XCTAssertEqual(content.errors.count, 1)
         })
+
+        try await app.asyncShutdown()
     }
 
     func testValidateNullWhenNotRequired() throws {
@@ -778,6 +794,40 @@ class ValidationTests: XCTestCase {
         }
     }
     
+
+    func testCustomValidator() {
+        let value = "test123"
+        let validationDescription = "test \'\(value)'"
+
+        // These tests are used to make sure that the custom validator pass and fail correctly.
+        assert(
+            value,
+            fails: !.custom(validationDescription) { x in
+                return x == value
+            },
+            "is successfully validated for custom validation '\(validationDescription)'."
+        )
+        assert(
+            value,
+            passes: !.custom(validationDescription) { x in
+                return x != value
+            }
+        )
+        assert(
+            value,
+            fails: .custom(validationDescription) { x in
+                return x != value
+            },
+            "is not successfully validated for custom validation '\(validationDescription)'."
+        )
+        assert(
+            value,
+            passes: .custom(validationDescription) { x in
+                return x == value
+            }
+        )
+    }
+
     func testCustomFailureDescriptions() throws {
         struct User: Validatable {
             var name: String

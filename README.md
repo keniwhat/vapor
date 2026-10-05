@@ -21,7 +21,7 @@
         <img src="https://img.shields.io/codecov/c/github/vapor/vapor?style=plastic&logo=codecov&label=codecov" alt="Code Coverage">
     </a>
     <a href="https://swift.org">
-        <img src="https://design.vapor.codes/images/swift57up.svg" alt="Swift 5.7+">
+        <img src="https://design.vapor.codes/images/swift60up.svg" alt="Swift 6.0+">
     </a>
     <a href="https://hachyderm.io/@codevapor">
         <img src="https://img.shields.io/badge/%20-@codevapor-6364f6.svg?style=plastic&logo=mastodon&labelColor=gray&logoColor=%239394ff" alt="Mastodon">
@@ -32,7 +32,7 @@
 
 Vapor is an HTTP web framework for Swift. It provides a beautifully expressive and easy-to-use foundation for your next website, API, or cloud project.
 
-Take a look at some of the [awesome stuff](https://github.com/Cellane/awesome-vapor) created with Vapor.
+Take a look at some of the [awesome stuff](https://github.com/vapor-community/awesome-vapor) created with Vapor.
 
 ### 💧 Community
 

@@ -157,8 +157,8 @@ final class HTTPHeaderTests: XCTestCase {
             let vaporSession = try XCTUnwrap(headers.setCookie?["vapor-session"])
             XCTAssertEqual(vaporSession.sameSite, HTTPCookies.SameSitePolicy.none)
             XCTAssertEqual(vaporSession.expires, Date(timeIntervalSince1970: 1622645877))
-            XCTAssertTrue(siwaState.isHTTPOnly)
-            XCTAssertTrue(siwaState.isSecure)
+            XCTAssertTrue(vaporSession.isHTTPOnly)
+            XCTAssertTrue(vaporSession.isSecure)
         }
     }
 
@@ -231,6 +231,18 @@ final class HTTPHeaderTests: XCTestCase {
         XCTAssertEqual(headers.cookie?["_ga"]?.string, "GA1.1.500315824.1585154561")
         XCTAssertEqual(headers.cookie?["_gid"]?.string, "GA1.1.500224287.1585154561")
         XCTAssertEqual(headers.cookie?["!#$%&'*+-.^_`~"]?.string, "symbols")
+    }
+
+    // https://github.com/vpor/vapor/issues/3435
+    func testMultipleCookieHeaders() throws {
+        let headers = HTTPHeaders([
+            ("cookie", "a=1"),
+            ("cookie", "b=2"),
+            ("cookie", "c=3"),
+        ])
+        XCTAssertEqual(headers.cookie?["a"]?.string, "1")
+        XCTAssertEqual(headers.cookie?["b"]?.string, "2")
+        XCTAssertEqual(headers.cookie?["c"]?.string, "3")
     }
 
     // https://github.com/vapor/vapor/issues/2316

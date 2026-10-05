@@ -1,8 +1,4 @@
-#if !canImport(Darwin) && swift(<5.9)
-@preconcurrency import Foundation
-#else
 import Foundation
-#endif
 import NIOHTTP1
 
 extension HTTPHeaders {
@@ -10,9 +6,7 @@ extension HTTPHeaders {
     /// This accesses the `"Cookie"` header.
     public var cookie: HTTPCookies? {
         get {
-            self.parseDirectives(name: .cookie).first.map {
-                HTTPCookies(directives: $0)
-            }
+            HTTPCookies(directives: self.parseDirectives(name: .cookie).flatMap { $0 })
         }
         set {
             if let cookieHeader = newValue?.cookieHeader {
@@ -193,7 +187,7 @@ public struct HTTPCookies: ExpressibleByDictionaryLiteral, Sendable {
         
         // MARK: Methods
         
-        /// Seriaizes an `HTTPCookie` to a `String`.
+        /// Serializes an `HTTPCookie` to a `String`.
         public func serialize(name: String) -> String {
             var serialized = "\(name)=\(self.string)"
             
@@ -264,7 +258,7 @@ public struct HTTPCookies: ExpressibleByDictionaryLiteral, Sendable {
     
     // MARK: Serialize
     
-    /// Seriaizes the `Cookies` for a `Request`
+    /// Serializes the `Cookies` for a `Request`
     var cookieHeader: String? {
         guard !self.cookies.isEmpty else {
             return nil

@@ -4,10 +4,17 @@ import Vapor
 import NIOCore
 
 final class ServiceTests: XCTestCase {
-    func testReadOnly() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
+    var app: Application!
 
+    override func setUp() async throws {
+        app = try await Application.make(.testing)
+    }
+
+    override func tearDown() async throws {
+        try await app.asyncShutdown()
+    }
+
+    func testReadOnly() throws {
         app.get("test") { req in
             req.readOnly.foos()
         }
@@ -19,16 +26,11 @@ final class ServiceTests: XCTestCase {
     }
 
     func testWritable() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
-
         app.writable = .init(apiKey: "foo")
         XCTAssertEqual(app.writable?.apiKey, "foo")
     }
 
     func testLifecycle() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
         app.http.server.configuration.port = 0
 
         app.lifecycle.use(Hello())
@@ -36,11 +38,18 @@ final class ServiceTests: XCTestCase {
         try app.start()
         app.running?.stop()
     }
+    
+    func testAsyncLifecycleHandler() async throws {
+        let app = try await Application.make(.testing)
+        app.http.server.configuration.port = 0
+        
+        app.lifecycle.use(AsyncHello())
+        app.environment.arguments = ["serve"]
+        try await app.startup()
+        app.running?.stop()
+    }
 
     func testLocks() throws {
-        let app = Application(.testing)
-        defer { app.shutdown() }
-
         app.sync.withLock {
             // Do something.
         }
@@ -51,6 +60,73 @@ final class ServiceTests: XCTestCase {
         test.withLock {
             // Do something.
         }
+    }
+    
+    func testServiceHelpers() throws {
+        let testString = "This is a test - \(Int.random())"
+        let myFakeService = MyTestService(cannedResponse: testString, eventLoop: app.eventLoopGroup.next(), logger: app.logger)
+        
+        app.services.myService.use { _ in
+            myFakeService
+        }
+        
+        app.get("myService") { req -> String in
+            let thing = req.services.myService.doSomething()
+            return thing
+        }
+        
+        try app.test(.GET, "myService", afterResponse: { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertEqual(res.body.string, testString)
+        })
+    }
+    
+    func testRepeatedAccessCausesNoStackOverflow() throws {
+        let myFakeService = MyTestService(cannedResponse: "", eventLoop: app.eventLoopGroup.next(), logger: app.logger)
+        app.services.myService.use { _ in myFakeService }
+        
+        let app = self.app!  // For use inside the sendable closure
+        try app.eventLoopGroup.next()
+            .future()
+            .map {
+                // ~6.7k iterations should already be sufficient, but even with this many iterations, the test still
+                // run quickly enough, and we would detect potential regressions even for larger stack sizes.
+                for _ in 1...100_000 {
+                    _ = app.services.myService.service
+                }
+            }
+            .wait()
+    }
+}
+
+protocol MyService {
+    func `for`(_ request: Request) -> MyService
+    func doSomething() -> String
+}
+
+extension Application.Services {
+    var myService: Application.Service<MyService> {
+        .init(application: self.application)
+    }
+}
+
+extension Request.Services {
+    var myService: MyService {
+        self.request.application.services.myService.service.for(request)
+    }
+}
+
+struct MyTestService: MyService {
+    let cannedResponse: String
+    let eventLoop: EventLoop
+    let logger: Logger
+    
+    func `for`(_ request: Vapor.Request) -> MyService {
+        return MyTestService(cannedResponse: self.cannedResponse, eventLoop: request.eventLoop, logger: request.logger)
+    }
+    
+    func doSomething() -> String {
+        return cannedResponse
     }
 }
 
@@ -89,6 +165,12 @@ private extension Application {
 
 private struct Hello: LifecycleHandler {
     func willBoot(_ app: Application) throws {
+        app.logger.info("Hello!")
+    }
+}
+
+private struct AsyncHello: LifecycleHandler {
+    func willBootAsync(_ app: Application) async throws {
         app.logger.info("Hello!")
     }
 }

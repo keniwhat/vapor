@@ -1,18 +1,23 @@
 @testable import Vapor
+import VaporTestUtils
+import XCTVapor
 import enum NIOHTTP1.HTTPParserError
 import XCTest
+import AsyncHTTPClient
 import NIOEmbedded
 import NIOCore
+import NIOConcurrencyHelpers
+import class NIOPosix.ClientBootstrap
 
 final class PipelineTests: XCTestCase {
     var app: Application!
     
     override func setUp() async throws {
-        app = Application(.testing)
+        app = try await Application.make(.testing)
     }
     
     override func tearDown() async throws {
-        app.shutdown()
+        try await app.asyncShutdown()
     }
     
     
@@ -66,6 +71,105 @@ final class PipelineTests: XCTestCase {
         try XCTAssertNil(channel.readOutbound(as: ByteBuffer.self)?.string)
     }
 
+    func testAsyncEchoHandlers() async throws {
+        app.on(.POST, "echo", body: .stream) { request async throws -> Response in
+            var buffers = [ByteBuffer]()
+            
+            for try await buffer in request.body {
+                buffers.append(buffer)
+            }
+            
+            return Response(body: .init(managedAsyncStream: { [buffers] writer in
+                for buffer in buffers {
+                    try await writer.writeBuffer(buffer)
+                }
+            }))
+        }
+        
+        app.environment.arguments = ["serve"]
+        app.http.server.configuration.port = 0
+        try await app.startup()
+        
+        guard
+            let localAddress = app.http.server.shared.localAddress,
+            let port = localAddress.port
+        else {
+            XCTFail("couldn't get port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+        
+        let client = HTTPClient()
+        
+        let chunks = [
+            "1\r\n",
+            "a",
+            "\r\n",
+            "1\r\n",
+            "b",
+            "\r\n",
+            "1\r\n",
+            "c",
+            "\r\n",
+        ]
+        
+        let response = try await client.post(url: "http://localhost:\(port)/echo", body: .stream { writer in
+            let box = UnsafeMutableTransferBox(writer)
+            @Sendable func write(chunks: [String]) -> EventLoopFuture<Void> {
+                var chunks = chunks
+                let chunk = chunks.removeFirst()
+                
+                if chunks.isEmpty {
+                    return box.wrappedValue.write(.byteBuffer(ByteBuffer(string: chunk)))
+                } else {
+                    return box.wrappedValue.write(.byteBuffer(ByteBuffer(string: chunk))).flatMap { [chunks] in
+                        return write(chunks: chunks)
+                    }
+                }
+            }
+            
+            return write(chunks: chunks)
+        }).get()
+        
+        XCTAssertEqual(response.body?.string, chunks.joined(separator: ""))
+        try await client.shutdown()
+    }
+
+    func testAsyncFailingHandlers() async throws {
+        app.on(.POST, "fail", body: .stream) { request async throws -> Response in
+            return Response(body: .init(managedAsyncStream: { writer in
+                try await writer.writeBuffer(.init(string: "foo"))
+                throw Abort(.internalServerError)
+            }))
+        }
+
+        app.environment.arguments = ["serve"]
+        app.http.server.configuration.port = 0
+        try await app.startup()
+
+        guard
+            let localAddress = app.http.server.shared.localAddress,
+            let port = localAddress.port
+        else {
+            XCTFail("couldn't get port from \(app.http.server.shared.localAddress.debugDescription)")
+            return
+        }
+
+        let client = HTTPClient()
+
+        do {
+            _ = try await client.post(url: "http://localhost:\(port)/fail").get()
+            XCTFail("Client has failed to detect broken server response")
+        } catch {
+            if let error = error as? HTTPParserError {
+                XCTAssertEqual(error, HTTPParserError.invalidEOFState)
+            } else {
+                XCTFail("Caught error \"\(error)\"")
+            }
+        }
+
+        try await client.shutdown()
+    }
+
     func testEOFFraming() throws {
         app.on(.POST, "echo", body: .stream) { request -> Response in
             Response(body: .init(stream: { writer in
@@ -91,6 +195,85 @@ final class PipelineTests: XCTestCase {
 
         try channel.writeInbound(ByteBuffer(string: "POST /echo HTTP/1.1\r\n\r\n"))
         try XCTAssertContains(channel.readOutbound(as: ByteBuffer.self)?.string, "HTTP/1.1 200 OK")
+    }
+
+    // https://github.com/vapor/vapor/issues/3002
+    func testResponseBodyStreamCallbackIsOnlyInvokedOnceWhenTheConnectionFails() throws {
+        let callbackCount = NIOLockedValueBox(0)
+        let completionCount = NIOLockedValueBox(0)
+
+        app.get("stream") { request -> Response in
+            Response(body: .init(stream: { writer in
+                callbackCount.withLockedValue { $0 += 1 }
+                // Mimic `Request.FileIO.streamFile(at:)`
+                writer.write(.buffer(ByteBuffer(string: "hello"))).whenComplete { result in
+                    switch result {
+                    case .failure(let error): writer.write(.error(error), promise: nil)
+                    case .success: writer.write(.end, promise: nil)
+                    }
+                    completionCount.withLockedValue { $0 += 1 }
+                }
+            }))
+        }
+
+        let channel = EmbeddedChannel()
+        try channel.connect(to: .init(unixDomainSocketPath: "/foo")).wait()
+        try channel.pipeline.addVaporHTTP1Handlers(
+            application: app,
+            responder: app.responder,
+            configuration: app.http.server.configuration
+        ).wait()
+        try channel.pipeline.syncOperations.addHandler(ConnectionResetHandler(), position: .first)
+
+        _ = try? channel.writeInbound(ByteBuffer(string: "GET /stream HTTP/1.1\r\n\r\n"))
+
+        XCTAssertEqual(callbackCount.withLockedValue { $0 }, 1, "The body stream callback should only be invoked once")
+        XCTAssertEqual(completionCount.withLockedValue { $0 }, 1, "The stream's completion handler should only be invoked once")
+    }
+
+    /// async version of test above
+    /// See https://github.com/vapor/vapor/issues/3002
+    func testAsyncResponseBodyStreamCallbackIsOnlyInvokedOnceWhenTheConnectionFails() async throws {
+        let callbackCount = NIOLockedValueBox(0)
+        let (completions, completionsContinuation) = AsyncStream<Void>.makeStream()
+
+        app.get("stream") { request -> Response in
+            Response(body: .init(asyncStream: { writer in
+                callbackCount.withLockedValue { $0 += 1 }
+                do {
+                    try await writer.write(.buffer(ByteBuffer(string: "hello")))
+                    try await writer.write(.end)
+                } catch {
+                    try? await writer.write(.error(error))
+                }
+                completionsContinuation.yield()
+            }))
+        }
+
+        let channel = NIOAsyncTestingChannel()
+        try await channel.connect(to: .init(unixDomainSocketPath: "/foo"))
+        let app = self.app!
+        let pipelineConfigured = try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.addVaporHTTP1Handlers(
+                application: app,
+                responder: app.responder,
+                configuration: app.http.server.configuration
+            )
+        }
+        try await pipelineConfigured.get()
+        try await channel.testingEventLoop.executeInContext {
+            try channel.pipeline.syncOperations.addHandler(ConnectionResetHandler(), position: .first)
+        }
+
+        _ = try? await channel.writeInbound(ByteBuffer(string: "GET /stream HTTP/1.1\r\n\r\n"))
+
+        var completionsIterator = completions.makeAsyncIterator()
+        await completionsIterator.next()
+
+        try await Task.sleep(for: .milliseconds(200))
+        await channel.testingEventLoop.run()
+
+        XCTAssertEqual(callbackCount.withLockedValue { $0 }, 1, "The body stream callback should only be invoked once")
     }
 
     func testBadStreamLength() throws {
@@ -155,7 +338,7 @@ final class PipelineTests: XCTestCase {
             return ResponseThing(eventLoop: eventLoop)
         }
         
-        try app.test(.GET, "dont-crash") { res in
+        try await app.test(.GET, "dont-crash") { res async in
             XCTAssertEqual(res.status, .ok)
         }
 
@@ -185,7 +368,7 @@ final class PipelineTests: XCTestCase {
             return "OK"
         }
         
-        try app.test(.GET, "dont-crash") { res in
+        try await app.test(.GET, "dont-crash") { res async in
             XCTAssertEqual(res.status, .ok)
         }
 
@@ -246,7 +429,114 @@ final class PipelineTests: XCTestCase {
         XCTAssertEqual(res.status, .ok)
     }
 
+    func testCorrectResponseOrder() async throws {
+        app.get("sleep", ":ms") { req -> String in
+            let ms = try req.parameters.require("ms", as: Int64.self)
+            try await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+            return "slept \(ms)ms"
+        }
+
+        let channel = NIOAsyncTestingChannel()
+        let app = self.app!
+        _ = try await (channel.eventLoop as! NIOAsyncTestingEventLoop).executeInContext {
+            channel.pipeline.addVaporHTTP1Handlers(
+                application: app,
+                responder: app.responder,
+                configuration: app.http.server.configuration
+            )
+        }
+
+        try await channel.writeInbound(ByteBuffer(string: "GET /sleep/100 HTTP/1.1\r\n\r\nGET /sleep/0 HTTP/1.1\r\n\r\n"))
+
+        // We expect 6 writes to be there - three parts (the head, body and separator for each request). However, if there are less
+        // we need to have a timeout to avoid hanging the test
+        let deadline = NIODeadline.now() + .seconds(5)
+        var responses: [String] = []
+        for _ in 0..<6 {
+            guard NIODeadline.now() < deadline else {
+                XCTFail("Timed out waiting for responses")
+                return
+            }
+            let res = try await channel.waitForOutboundWrite(as: ByteBuffer.self).string
+            if res.contains("slept") {
+                responses.append(res)
+            }
+        }
+
+        XCTAssertEqual(responses.count, 2)
+        XCTAssertEqual(responses[0], "slept 100ms")
+        XCTAssertEqual(responses[1], "slept 0ms")
+    }
+
+    func testCorrectResponseOrderOverVaporTCP() async throws {
+        app.get("sleep", ":ms") { req -> String in
+            let ms = try req.parameters.require("ms", as: Int64.self)
+            try await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+            return "slept \(ms)ms"
+        }
+
+        app.environment.arguments = ["serve"]
+        app.http.server.configuration.port = 0
+        try await app.startup()
+
+        let channel = try await ClientBootstrap(group: app.eventLoopGroup)
+            .connect(host: "127.0.0.1", port: app.http.server.configuration.port) { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try NIOAsyncChannel(
+                        wrappingChannelSynchronously: channel,
+                        configuration: NIOAsyncChannel.Configuration(
+                            inboundType: ByteBuffer.self,
+                            outboundType: ByteBuffer.self
+                        )
+                    )
+                }
+            }
+
+        _ = try await channel.executeThenClose { inbound, outbound in
+            try await outbound.write(ByteBuffer(string: "GET /sleep/100 HTTP/1.1\r\n\r\nGET /sleep/0 HTTP/1.1\r\n\r\n"))
+
+            var data = ByteBuffer()
+            var sleeps = 0
+            for try await chunk in inbound {
+                data.writeImmutableBuffer(chunk)
+                data.writeString("\r\n")
+                
+                if String(decoding: chunk.readableBytesView, as: UTF8.self).components(separatedBy: "\r\n").contains(where: { $0.hasPrefix("slept") }) {
+                    sleeps += 1
+                }
+                if sleeps == 2 {
+                    break
+                }
+            }
+
+            let sleptLines = String(decoding: data.readableBytesView, as: UTF8.self).components(separatedBy: "\r\n").filter { $0.contains("slept") }
+            XCTAssertEqual(sleptLines, ["slept 100ms", "slept 0ms"])
+            return sleptLines
+        }
+    }
+
     override class func setUp() {
         XCTAssert(isLoggingConfigured)
     }
 }
+
+private struct SimulatedConnectionReset: Error { }
+
+/// Forwards the response head, then fails every subsequent write, mimicking a client that resets
+/// the connection before the response body has been fully streamed.
+private final class ConnectionResetHandler: ChannelOutboundHandler {
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private var hasWrittenHead = false
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        if self.hasWrittenHead {
+            promise?.fail(SimulatedConnectionReset())
+        } else {
+            self.hasWrittenHead = true
+            context.write(data, promise: promise)
+        }
+    }
+}
+

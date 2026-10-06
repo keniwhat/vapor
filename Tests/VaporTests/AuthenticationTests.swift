@@ -3,7 +3,11 @@ import XCTest
 import Vapor
 import NIOCore
 import NIOPosix
+#if canImport(Android)
+import func Android.sleep
+#endif
 
+@available(*, deprecated, message: "Test old future APIs")
 final class AuthenticationTests: XCTestCase {
     func testBearerAuthenticator() throws {
         struct Test: Authenticatable {
@@ -278,6 +282,46 @@ final class AuthenticationTests: XCTestCase {
         }
     }
 
+    /// A regression test ensuring that if no auth cookie is provided, the `AsyncSessionAuthenticator`
+    /// does not end up creating an empty session and sending back `set-cookie`.
+    /// This is a valid use case when session-based auth is not required.
+    /// In the other test above (testSessionAuthentication), the `set-cookie` header is correctly omitted
+    /// because the guard middleware throws an error, which skips the `addCookies` method in
+    /// the `SessionsMiddleware`.
+    func testSessionNotCreatedWhenNoCookieProvided() throws {
+        struct Test: Authenticatable, SessionAuthenticatable {
+            var sessionID: String
+        }
+
+        struct TestSessionAuthenticator: SessionAuthenticator {
+            typealias User = Test
+
+            func authenticate(sessionID: String, for request: Request) -> EventLoopFuture<Void> {
+                request.auth.login(Test(sessionID: sessionID))
+                return request.eventLoop.makeSucceededFuture(())
+            }
+        }
+
+        struct UserInfo: Content {
+            var name: String
+        }
+
+        let app = Application(.testing)
+        defer { app.shutdown() }
+
+        app.routes.grouped([
+            app.sessions.middleware,
+            TestSessionAuthenticator()
+        ]).get("test") { req -> UserInfo in
+            UserInfo(name: req.auth.get(Test.self)?.sessionID ?? "none")
+        }
+
+        try app.testable().test(.GET, "/test") { res in
+            XCTAssertEqual(res.status, .ok)
+            XCTAssertNil(res.headers.first(name: .setCookie))
+        }
+    }
+
     func testMiddlewareConfigExistential() {
         struct Test: Authenticatable {
             static func authenticator() -> Authenticator {
@@ -300,29 +344,21 @@ final class AuthenticationTests: XCTestCase {
 
     func testAsyncAuthenticator() throws {
         struct Test: Authenticatable {
-            static func authenticator(threadPool: NIOThreadPool) -> Authenticator {
+            static func authenticator(threadPool: NIOThreadPool) -> AsyncAuthenticator {
                 TestAuthenticator(threadPool: threadPool)
             }
             var name: String
         }
 
-        struct TestAuthenticator: BasicAuthenticator {
+        struct TestAuthenticator: AsyncBasicAuthenticator {
             typealias User = Test
             let threadPool: NIOThreadPool
 
-            func authenticate(basic: BasicAuthorization, for request: Request) -> EventLoopFuture<Void> {
-                let promise = request.eventLoop.makePromise(of: Void.self)
-                self.threadPool.submit { _ in
-                    sleep(1)
-                    request.eventLoop.execute {
-                        if basic.username == "test" && basic.password == "secret" {
-                            let test = Test(name: "Vapor")
-                            request.auth.login(test)
-                        }
-                        promise.succeed(())
-                    }
+            func authenticate(basic: BasicAuthorization, for request: Request) async throws {
+                if basic.username == "test" && basic.password == "secret" {
+                    let test = Test(name: "Vapor")
+                    request.auth.login(test)
                 }
-                return promise.futureResult
             }
         }
 

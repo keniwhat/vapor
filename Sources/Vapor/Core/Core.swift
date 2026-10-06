@@ -19,7 +19,8 @@ extension Application {
         set { self.core.storage.asyncCommands.withLockedValue { $0 = newValue } }
     }
 
-    /// The application thread pool. Vapor provides a thread pool with 64 threads by default.
+    /// The application thread pool. Vapor uses `NIOSingletons.posixBlockingThreadPool` by default for this,
+    /// which defaults to a thread pool of size equal to the number of available cores.
     ///
     /// It's possible to configure the thread pool size by overriding this value with your own thread pool.
     ///
@@ -39,7 +40,14 @@ extension Application {
             }
 
             self.core.storage.threadPool.withLockedValue({
-                try! $0.syncShutdownGracefully()
+                do {
+                    try $0.syncShutdownGracefully()
+                } catch is NIOThreadPoolError.UnsupportedOperation {
+                    // ignore, singleton thread pool throws this error on shutdown attempts
+                    // see https://github.com/apple/swift-nio/blob/c51907a839e63ebf0ba2076bba73dd96436bd1b9/Sources/NIOPosix/NIOThreadPool.swift#L142-L147
+                } catch {
+                    fatalError("Unexpected error shutting down old thread pool")
+                }
                 $0 = newValue
                 $0.start()
             })
@@ -80,11 +88,11 @@ extension Application {
 
             init() {
                 self.console = .init(Terminal())
-                var commands = Commands()
-                commands.use(BootCommand(), as: "boot")
-                self.commands = .init(commands)
+                self.commands = .init(Commands())
+                var asyncCommands = AsyncCommands()
+                asyncCommands.use(BootCommand(), as: "boot")
                 self.asyncCommands = .init(AsyncCommands())
-                let threadPool = NIOThreadPool(numberOfThreads: System.coreCount)
+                let threadPool = NIOSingletons.posixBlockingThreadPool
                 threadPool.start()
                 self.threadPool = .init(threadPool)
                 self.allocator = .init()
@@ -95,7 +103,27 @@ extension Application {
 
         struct LifecycleHandler: Vapor.LifecycleHandler {
             func shutdown(_ application: Application) {
-                try! application.threadPool.syncShutdownGracefully()
+                do {
+                    try application.threadPool.syncShutdownGracefully()
+                } catch is NIOThreadPoolError.UnsupportedOperation {
+                    // ignore, singleton thread pool throws this error on shutdown attempts
+                    // see https://github.com/apple/swift-nio/blob/c51907a839e63ebf0ba2076bba73dd96436bd1b9/Sources/NIOPosix/NIOThreadPool.swift#L142-L147
+                } catch {
+                    application.logger.debug("Failed to shutdown thread pool", metadata: ["error": "\(error)"])
+                }
+            }
+        }
+        
+        struct AsyncLifecycleHandler: Vapor.LifecycleHandler {
+            func shutdownAsync(_ application: Application) async {
+                do {
+                    try await application.threadPool.shutdownGracefully()
+                } catch is NIOThreadPoolError.UnsupportedOperation {
+                    // ignore, singleton thread pool throws this error on shutdown attempts
+                    // see https://github.com/apple/swift-nio/blob/c51907a839e63ebf0ba2076bba73dd96436bd1b9/Sources/NIOPosix/NIOThreadPool.swift#L142-L147
+                } catch {
+                    application.logger.debug("Failed to shutdown thread pool", metadata: ["error": "\(error)"])
+                }
             }
         }
 
@@ -112,9 +140,13 @@ extension Application {
             return storage
         }
 
-        func initialize() {
+        func initialize(asyncEnvironment: Bool) {
             self.application.storage[Key.self] = .init()
-            self.application.lifecycle.use(LifecycleHandler())
+            if asyncEnvironment {
+                self.application.lifecycle.use(AsyncLifecycleHandler())
+            } else {
+                self.application.lifecycle.use(LifecycleHandler())
+            }
         }
     }
 }

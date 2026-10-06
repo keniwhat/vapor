@@ -2,7 +2,8 @@ import Logging
 import ConsoleKit
 
 extension LoggingSystem {
-    public static func bootstrap(from environment: inout Environment, _ factory: (Logger.Level) -> (String) -> LogHandler) throws {
+    @preconcurrency
+    public static func bootstrap(from environment: inout Environment, _ factory: @Sendable (Logger.Level) -> (@Sendable (String) -> LogHandler)) throws {
         let level = try Logger.Level.detect(from: &environment)
 
         // Bootstrap logger with a factory created by the factoryfactory.
@@ -19,10 +20,7 @@ extension LoggingSystem {
     }
 }
 
-extension Logger.Level: LosslessStringConvertible {
-    public init?(_ description: String) { self.init(rawValue: description.lowercased()) }
-    public var description: String { self.rawValue }
-
+extension Logging.Logger.Level {
     public static func detect(from environment: inout Environment) throws -> Logger.Level {
         struct LogSignature: CommandSignature {
             @Option(name: "log", help: "Change log level")

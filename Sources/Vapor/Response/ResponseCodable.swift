@@ -4,7 +4,7 @@ import NIOHTTP1
 /// Can convert `self` to a `Response`.
 ///
 /// Types that conform to this protocol can be returned in route closures.
-public protocol ResponseEncodable {
+public protocol ResponseEncodable: VaporSendableMetatype {
     /// Encodes an instance of `Self` to a `Response`.
     ///
     /// - parameters:
@@ -89,7 +89,9 @@ extension EventLoopFuture: ResponseEncodable where Value: ResponseEncodable {
     // See `ResponseEncodable`.
     public func encodeResponse(for request: Request) -> EventLoopFuture<Response> {
         return self.flatMap { t in
-            return t.encodeResponse(for: request)
+            return request.propagateTracingIfEnabled {
+                t.encodeResponse(for: request)
+            }
         }
     }
 }

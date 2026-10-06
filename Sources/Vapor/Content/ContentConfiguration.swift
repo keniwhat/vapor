@@ -16,7 +16,7 @@ import NIOConcurrencyHelpers
 ///
 /// Most often, these configured coders are used to encode and decode types conforming to ``Content``.
 /// See the ``Content`` protocol for more information.
-public struct ContentConfiguration {
+public struct ContentConfiguration: Sendable {
     public static var global: ContentConfiguration {
         get {
             _global.withLockedValue { $0 }
@@ -127,7 +127,7 @@ public struct ContentConfiguration {
     ///     
     public func requireDecoder(for mediaType: HTTPMediaType) throws -> ContentDecoder {
         guard let decoder = self.decoders[mediaType] else {
-            throw Abort(.unsupportedMediaType, reason: "Support for reading media type '\(mediaType) has not been configured.")
+            throw Abort(.unsupportedMediaType, reason: "Support for reading media type '\(mediaType)' has not been configured.")
         }
         
         return decoder

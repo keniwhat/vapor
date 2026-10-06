@@ -4,6 +4,8 @@ import NIOHTTP1
 import Logging
 import RoutingKit
 import NIOConcurrencyHelpers
+import ServiceContextModule
+import X509
 
 /// Represents an HTTP request in an application.
 public final class Request: CustomStringConvertible, Sendable {
@@ -57,7 +59,7 @@ public final class Request: CustomStringConvertible, Sendable {
     /// A unique ID for the request.
     ///
     /// The request identifier is set to value of the `X-Request-Id` header when present, or to a
-    /// uniquelly generated value otherwise.
+    /// uniquely generated value otherwise.
     public let id: String
     
     // MARK: Metadata
@@ -94,6 +96,12 @@ public final class Request: CustomStringConvertible, Sendable {
         }
 
         return self.remoteAddress
+    }
+
+    /// The validated certificate chain. This returns nil if the peer did not authenticate with a certificate. Requires
+    /// configuring a `customCertificateVerifyCallbackWithMetadata` that performs the verification.
+    public var peerCertificateChain: ValidatedCertificateChain? {
+        return self.requestBox.withLockedValue { $0.peerCertificateChain }
     }
 
     // MARK: Content
@@ -185,6 +193,15 @@ public final class Request: CustomStringConvertible, Sendable {
         }
     }
     
+    public var serviceContext: ServiceContext {
+        get {
+            self._serviceContext.withLockedValue { $0 }
+        }
+        set {
+            self._serviceContext.withLockedValue { $0 = newValue }
+        }
+    }
+    
     public var body: Body {
         return Body(self)
     }
@@ -225,6 +242,9 @@ public final class Request: CustomStringConvertible, Sendable {
     ///  If this is difficult or awkward to guarantee, use `EventLoopFuture.hop(to:)` to jump to this event loop.
     public let eventLoop: EventLoop
     
+    /// Whether Vapor should automatically propagate trace spans for this request. See `Application.traceAutoPropagation`
+    let traceAutoPropagation: Bool
+    
     /// A container containing the route parameters that were captured when receiving this request.
     /// Use this container to grab any non-static parameters from the URL, such as model IDs in a REST API.
     public var parameters: Parameters {
@@ -263,12 +283,14 @@ public final class Request: CustomStringConvertible, Sendable {
         var isKeepAlive: Bool
         var route: Route?
         var parameters: Parameters
+        var peerCertificateChain: ValidatedCertificateChain?
         var byteBufferAllocator: ByteBufferAllocator
     }
     
     let requestBox: NIOLockedValueBox<RequestBox>
     private let _storage: NIOLockedValueBox<Storage>
     private let _logger: NIOLockedValueBox<Logger>
+    private let _serviceContext: NIOLockedValueBox<ServiceContext>
     internal let bodyStorage: NIOLockedValueBox<BodyStorage>
     
     public convenience init(
@@ -299,7 +321,66 @@ public final class Request: CustomStringConvertible, Sendable {
             self.headers.updateContentLength(body.readableBytes)
         }
     }
-    
+
+    public convenience init(
+        application: Application,
+        method: HTTPMethod = .GET,
+        url: URI = "/",
+        version: HTTPVersion = .init(major: 1, minor: 1),
+        headers: HTTPHeaders = .init(),
+        collectedBody: ByteBuffer? = nil,
+        remoteAddress: SocketAddress? = nil,
+        peerCertificateChain: ValidatedCertificateChain?,
+        logger: Logger = .init(label: "codes.vapor.request"),
+        byteBufferAllocator: ByteBufferAllocator = ByteBufferAllocator(),
+        on eventLoop: EventLoop
+    ) {
+        self.init(
+            application: application,
+            method: method,
+            url: url,
+            version: version,
+            headersNoUpdate: headers,
+            collectedBody: collectedBody,
+            remoteAddress: remoteAddress,
+            peerCertificateChain: peerCertificateChain,
+            logger: logger,
+            byteBufferAllocator: byteBufferAllocator,
+            on: eventLoop
+        )
+        if let body = collectedBody {
+            self.headers.updateContentLength(body.readableBytes)
+        }
+    }
+
+    @_disfavoredOverload
+    public convenience init(
+        application: Application,
+        method: HTTPMethod,
+        url: URI,
+        version: HTTPVersion = .init(major: 1, minor: 1),
+        headersNoUpdate headers: HTTPHeaders = .init(),
+        collectedBody: ByteBuffer? = nil,
+        remoteAddress: SocketAddress? = nil,
+        logger: Logger = .init(label: "codes.vapor.request"),
+        byteBufferAllocator: ByteBufferAllocator = ByteBufferAllocator(),
+        on eventLoop: EventLoop
+    ) {
+        self.init(
+            application: application,
+            method: method,
+            url: url,
+            version: version,
+            headersNoUpdate: headers,
+            collectedBody: collectedBody,
+            remoteAddress: remoteAddress,
+            peerCertificateChain: nil,
+            logger: logger,
+            byteBufferAllocator: byteBufferAllocator,
+            on: eventLoop
+        )
+    }
+
     public init(
         application: Application,
         method: HTTPMethod,
@@ -308,6 +389,7 @@ public final class Request: CustomStringConvertible, Sendable {
         headersNoUpdate headers: HTTPHeaders = .init(),
         collectedBody: ByteBuffer? = nil,
         remoteAddress: SocketAddress? = nil,
+        peerCertificateChain: ValidatedCertificateChain?,
         logger: Logger = .init(label: "codes.vapor.request"),
         byteBufferAllocator: ByteBufferAllocator = ByteBufferAllocator(),
         on eventLoop: EventLoop
@@ -323,6 +405,7 @@ public final class Request: CustomStringConvertible, Sendable {
         var logger = logger
         logger[metadataKey: "request-id"] = .string(requestId)
         self._logger = .init(logger)
+        self._serviceContext = .init(.topLevel)
         
         let storageBox = RequestBox(
             method: method,
@@ -332,15 +415,28 @@ public final class Request: CustomStringConvertible, Sendable {
             isKeepAlive: true,
             route: nil,
             parameters: .init(),
+            peerCertificateChain: peerCertificateChain,
             byteBufferAllocator: byteBufferAllocator
         )
         self.requestBox = .init(storageBox)
         self.id = requestId
         self.application = application
+        self.traceAutoPropagation = application.traceAutoPropagation
         
         self.remoteAddress = remoteAddress
         self.eventLoop = eventLoop
         self._storage = .init(.init())
         self.bodyStorage = .init(bodyStorage)
+    }
+
+    /// Automatically restores tracing serviceContext around the provided closure
+    func propagateTracingIfEnabled<T>(_ closure: () throws -> T) rethrows -> T {
+        if self.traceAutoPropagation {
+            return try ServiceContext.withValue(self.serviceContext) {
+                try closure()
+            }
+        } else {
+            return try closure()
+        }
     }
 }

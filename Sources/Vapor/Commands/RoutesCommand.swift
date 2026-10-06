@@ -14,7 +14,7 @@ import RoutingKit
 /// is a parameter whose result will be discarded.
 ///
 /// The path will be displayed with the same syntax that is used to register a route.
-public final class RoutesCommand: Command {
+public final class RoutesCommand: AsyncCommand {
     public struct Signature: CommandSignature {
         public init() { }
     }
@@ -24,13 +24,13 @@ public final class RoutesCommand: Command {
     }
 
     init() { }
-
-    public func run(using context: CommandContext, signature: Signature) throws {
+    
+    public func run(using context: ConsoleKitCommands.CommandContext, signature: Signature) async throws {
         let routes = context.application.routes
         let includeDescription = !routes.all.filter { $0.userInfo["description"] != nil }.isEmpty
         let pathSeparator = "/".consoleText()
         context.console.outputASCIITable(routes.all.map { route -> [ConsoleText] in
-            var column = [route.method.string.consoleText()]
+            var column = [route.method.rawValue.consoleText()]
             if route.path.isEmpty {
                 column.append(pathSeparator)
             } else {
